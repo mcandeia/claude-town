@@ -20,26 +20,111 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// ClaudeTaskType defines the type of task
+// +kubebuilder:validation:Enum=IssueSolve;PRReviewFix
+type ClaudeTaskType string
+
+const (
+	ClaudeTaskTypeIssueSolve  ClaudeTaskType = "IssueSolve"
+	ClaudeTaskTypePRReviewFix ClaudeTaskType = "PRReviewFix"
+)
+
+// ClaudeTaskPhase defines the phase of a task
+type ClaudeTaskPhase string
+
+const (
+	ClaudeTaskPhasePending   ClaudeTaskPhase = "Pending"
+	ClaudeTaskPhaseRunning   ClaudeTaskPhase = "Running"
+	ClaudeTaskPhaseCompleted ClaudeTaskPhase = "Completed"
+	ClaudeTaskPhaseFailed    ClaudeTaskPhase = "Failed"
+)
 
 // ClaudeTaskSpec defines the desired state of ClaudeTask.
 type ClaudeTaskSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Repository is the full repo name (owner/repo)
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$`
+	Repository string `json:"repository"`
 
-	// Foo is an example field of ClaudeTask. Edit claudetask_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// Issue is the GitHub issue number
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	Issue int `json:"issue"`
+
+	// PullRequest is the PR number (non-zero when fixing PR review)
+	// +optional
+	PullRequest int `json:"pullRequest,omitempty"`
+
+	// TaskType specifies what kind of task this is
+	// +kubebuilder:default=IssueSolve
+	TaskType ClaudeTaskType `json:"taskType,omitempty"`
+
+	// Branch is the git branch to work on (set for PRReviewFix)
+	// +optional
+	Branch string `json:"branch,omitempty"`
+
+	// Prompt is an optional override for the Claude prompt
+	// +optional
+	Prompt string `json:"prompt,omitempty"`
+
+	// MaxIterations is the maximum Claude iteration loops
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=50
+	MaxIterations int `json:"maxIterations,omitempty"`
+}
+
+// CostReport contains token usage and cost information
+type CostReport struct {
+	// InputTokens is the total input tokens used
+	InputTokens int64 `json:"inputTokens,omitempty"`
+
+	// OutputTokens is the total output tokens used
+	OutputTokens int64 `json:"outputTokens,omitempty"`
+
+	// EstimatedCost is the estimated cost in USD
+	EstimatedCost string `json:"estimatedCost,omitempty"`
 }
 
 // ClaudeTaskStatus defines the observed state of ClaudeTask.
 type ClaudeTaskStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Phase is the current phase of the task
+	Phase ClaudeTaskPhase `json:"phase,omitempty"`
+
+	// SandboxClaimName is the name of the SandboxClaim created for this task
+	SandboxClaimName string `json:"sandboxClaimName,omitempty"`
+
+	// PodName is the name of the sandbox pod
+	PodName string `json:"podName,omitempty"`
+
+	// PodIP is the IP address of the sandbox pod
+	PodIP string `json:"podIP,omitempty"`
+
+	// StartTime is when the task started running
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// CompletionTime is when the task completed
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// PullRequestURL is the URL of the created PR
+	PullRequestURL string `json:"pullRequestURL,omitempty"`
+
+	// CostReport contains token usage and cost info
+	CostReport *CostReport `json:"costReport,omitempty"`
+
+	// Conditions represent the latest available observations
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.repository`
+// +kubebuilder:printcolumn:name="Issue",type=integer,JSONPath=`.spec.issue`
+// +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.taskType`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="PR",type=string,JSONPath=`.status.pullRequestURL`
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ClaudeTask is the Schema for the claudetasks API.
 type ClaudeTask struct {

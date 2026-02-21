@@ -20,26 +20,43 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // ClaudeRepositorySpec defines the desired state of ClaudeRepository.
 type ClaudeRepositorySpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Owner is the GitHub organization or user
+	// +kubebuilder:validation:Required
+	Owner string `json:"owner"`
 
-	// Foo is an example field of ClaudeRepository. Edit clauderepository_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// Repo is the repository name
+	// +kubebuilder:validation:Required
+	Repo string `json:"repo"`
+
+	// Labels restricts the bot to only respond on issues with these labels.
+	// Empty means all issues are allowed.
+	// +optional
+	Labels []string `json:"labels,omitempty"`
+
+	// MaxConcurrentTasks is the maximum number of concurrent tasks for this repo
+	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=1
+	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
 }
 
 // ClaudeRepositoryStatus defines the observed state of ClaudeRepository.
 type ClaudeRepositoryStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// ActiveTasks is the current number of running tasks for this repo
+	ActiveTasks int `json:"activeTasks,omitempty"`
+
+	// Conditions represent the latest available observations
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Owner",type=string,JSONPath=`.spec.owner`
+// +kubebuilder:printcolumn:name="Repo",type=string,JSONPath=`.spec.repo`
+// +kubebuilder:printcolumn:name="Max Tasks",type=integer,JSONPath=`.spec.maxConcurrentTasks`
+// +kubebuilder:printcolumn:name="Active",type=integer,JSONPath=`.status.activeTasks`
 
 // ClaudeRepository is the Schema for the clauderepositories API.
 type ClaudeRepository struct {
@@ -48,6 +65,11 @@ type ClaudeRepository struct {
 
 	Spec   ClaudeRepositorySpec   `json:"spec,omitempty"`
 	Status ClaudeRepositoryStatus `json:"status,omitempty"`
+}
+
+// FullName returns "owner/repo"
+func (r *ClaudeRepository) FullName() string {
+	return r.Spec.Owner + "/" + r.Spec.Repo
 }
 
 // +kubebuilder:object:root=true
