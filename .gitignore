@@ -25,3 +25,10 @@ go.work
 *.swp
 *.swo
 *~
+
+# Local dev scripts with secrets
+hack/local-*.sh
+*.pem
+
+# Worktrees
+.worktrees/
