@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "claude-town.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "claude-town.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "claude-town.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "claude-town.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "claude-town.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8443
+            - --metrics-secure=true
+          env:
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-github
+                  key: appId
+            - name: GITHUB_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-github
+                  key: installationId
+            - name: GITHUB_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-github
+                  key: privateKey
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-github
+                  key: webhookSecret
+            - name: GITHUB_BOT_NAME
+              value: {{ .Values.github.botName | quote }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-anthropic
+                  key: apiKey
+            - name: SELF_DNS
+              value: {{ .Values.selfDNS | quote }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ .Values.sandbox.namespace | quote }}
+            - name: SANDBOX_TEMPLATE_NAME
+              value: {{ .Values.sandbox.templateName | quote }}
+            - name: WEBHOOK_PORT
+              value: {{ .Values.webhookPort | quote }}
+          ports:
+            - name: webhook
+              containerPort: {{ .Values.webhookPort }}
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            - name: metrics
+              containerPort: 8443
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

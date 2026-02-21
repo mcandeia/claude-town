@@ -1,0 +1,11 @@
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: {{ .Values.sandbox.templateName }}-pool
+  namespace: {{ .Values.sandbox.namespace }}
+  labels:
+    {{- include "claude-town.labels" . | nindent 4 }}
+spec:
+  sandboxTemplateRef:
+    name: {{ .Values.sandbox.templateName }}
+  replicas: {{ .Values.warmPool.replicas }}

@@ -1,0 +1,45 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "claude-town.fullname" . }}
+  labels:
+    {{- include "claude-town.labels" . | nindent 4 }}
+rules:
+  # ClaudeTask CRD
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["claudetasks"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["claudetasks/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["claudetasks/finalizers"]
+    verbs: ["update"]
+  # ClaudeRepository CRD
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["clauderepositories"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["clauderepositories/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["claude-town.claude-town.io"]
+    resources: ["clauderepositories/finalizers"]
+    verbs: ["update"]
+  # agent-sandbox CRDs
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  # Pods (for getting pod IP)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]

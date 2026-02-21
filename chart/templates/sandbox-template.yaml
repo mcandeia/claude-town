@@ -1,0 +1,26 @@
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: {{ .Values.sandbox.templateName }}
+  namespace: {{ .Values.sandbox.namespace }}
+  labels:
+    {{- include "claude-town.labels" . | nindent 4 }}
+spec:
+  template:
+    spec:
+      containers:
+        - name: claude
+          image: "{{ .Values.claudeImage.repository }}:{{ .Values.claudeImage.tag }}"
+          ports:
+            - containerPort: 7681
+              name: pty
+          env:
+            - name: CLAUDE_PTY_PORT
+              value: "7681"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"

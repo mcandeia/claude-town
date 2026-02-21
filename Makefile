@@ -360,3 +360,27 @@ catalog-build: opm ## Build a catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+##@ Helm
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart
+	helm lint chart/
+
+.PHONY: helm-install
+helm-install: ## Install the Helm chart
+	helm upgrade --install claude-town chart/ -n claude-town-system --create-namespace
+
+.PHONY: helm-template
+helm-template: ## Render Helm templates
+	helm template claude-town chart/
+
+##@ Kind
+
+.PHONY: kind-setup
+kind-setup: ## Setup KIND cluster with agent-sandbox
+	bash hack/setup-kind.sh
+
+.PHONY: kind-load
+kind-load: docker-build ## Build and load images into KIND
+	kind load docker-image ${IMG} --name claude-town

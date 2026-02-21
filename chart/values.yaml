@@ -1,0 +1,39 @@
+image:
+  repository: ghcr.io/marcoscandeia/claude-town
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+claudeImage:
+  repository: ghcr.io/marcoscandeia/claude
+  tag: latest
+
+github:
+  appId: ""
+  installationId: ""
+  privateKey: ""
+  webhookSecret: ""
+  botName: "claude-town"
+
+anthropic:
+  apiKey: ""
+
+selfDNS: ""
+
+sandbox:
+  namespace: claude-town-system
+  templateName: claude-sandbox
+
+warmPool:
+  replicas: 2
+
+webhookPort: 8082
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
