@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- claude-town_v1alpha1_claudetask.yaml
+- claude-town_v1alpha1_clauderepository.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

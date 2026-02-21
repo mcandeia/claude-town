@@ -1,0 +1,27 @@
+# This rule is not used by the project claude-town itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants full permissions ('*') over claude-town.claude-town.io.
+# This role is intended for users authorized to modify roles and bindings within the cluster,
+# enabling them to delegate specific permissions to other users or groups as needed.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: claude-town
+    app.kubernetes.io/managed-by: kustomize
+  name: claudetask-admin-role
+rules:
+- apiGroups:
+  - claude-town.claude-town.io
+  resources:
+  - claudetasks
+  verbs:
+  - '*'
+- apiGroups:
+  - claude-town.claude-town.io
+  resources:
+  - claudetasks/status
+  verbs:
+  - get

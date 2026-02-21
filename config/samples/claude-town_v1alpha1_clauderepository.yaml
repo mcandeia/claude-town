@@ -1,0 +1,9 @@
+apiVersion: claude-town.claude-town.io/v1alpha1
+kind: ClaudeRepository
+metadata:
+  labels:
+    app.kubernetes.io/name: claude-town
+    app.kubernetes.io/managed-by: kustomize
+  name: clauderepository-sample
+spec:
+  # TODO(user): Add fields here
