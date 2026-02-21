@@ -1,121 +1,136 @@
-# claude-town
-// TODO(user): Add simple overview of use/purpose
+# Claude Town
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Kubernetes operator that spawns Claude Code agents to solve GitHub issues and fix PR reviews.
 
-## Getting Started
+## How it works
 
-### Prerequisites
-- go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+1. You mention `@your-bot-name` in a GitHub issue or PR review
+2. The operator receives the webhook and creates a `ClaudeTask`
+3. A Claude sandbox is allocated from a pre-warmed pool (via [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox))
+4. Claude clones the repo, reads the issue context, and implements a solution
+5. Claude opens a PR and comments back on the issue
+6. The sandbox is released back to the pool
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Prerequisites
 
-```sh
-make docker-build docker-push IMG=<some-registry>/claude-town:tag
+- Kubernetes cluster (or KIND for local development)
+- [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) installed
+- Helm 3
+- A GitHub App
+- An Anthropic API key
+
+## Setup
+
+### 1. Create a GitHub App
+
+Create a new GitHub App at https://github.com/settings/apps/new with:
+
+**Permissions:**
+- Issues: Read & Write
+- Pull Requests: Read & Write
+- Contents: Read & Write
+- Metadata: Read
+
+**Subscribe to events:**
+- Issue comment
+- Pull request review
+- Pull request review comment
+
+Save the App ID, generate a private key, and note the Installation ID after installing the app on your org/repos.
+
+### 2. Install
+
+```bash
+helm install claude-town chart/ \
+  --namespace claude-town-system \
+  --create-namespace \
+  --set github.appId="YOUR_APP_ID" \
+  --set github.installationId="YOUR_INSTALLATION_ID" \
+  --set-file github.privateKey=path/to/private-key.pem \
+  --set github.webhookSecret="YOUR_SECRET" \
+  --set anthropic.apiKey="YOUR_ANTHROPIC_KEY" \
+  --set selfDNS="your-domain.com"
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+### 3. Allow repositories
 
-**Install the CRDs into the cluster:**
+Create a `ClaudeRepository` resource for each repo you want the bot to work on:
 
-```sh
-make install
+```yaml
+apiVersion: claude-town.claude-town.io/v1alpha1
+kind: ClaudeRepository
+metadata:
+  name: my-org-my-repo
+  namespace: claude-town-system
+spec:
+  owner: my-org
+  repo: my-repo
+  maxConcurrentTasks: 3
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 4. Use it
 
-```sh
-make deploy IMG=<some-registry>/claude-town:tag
+Comment on any issue in an allowed repository:
+
+> @your-bot-name please fix this bug
+
+Claude will spawn, work on the issue, and open a PR.
+
+To fix PR review feedback:
+
+> @your-bot-name please address this review
+
+## Local Development
+
+```bash
+# Prerequisites: kind, helm, docker, cloudflared
+export GITHUB_APP_ID=...
+export GITHUB_INSTALLATION_ID=...
+export GITHUB_APP_PRIVATE_KEY_FILE=./private-key.pem
+export GITHUB_WEBHOOK_SECRET=...
+export ANTHROPIC_API_KEY=...
+
+# Setup KIND cluster with everything installed
+make kind-setup
+
+# In a separate terminal, start the tunnel:
+cloudflared tunnel --url http://localhost:30082
+
+# Copy the tunnel URL and update:
+helm upgrade claude-town chart/ -n claude-town-system --set selfDNS=<tunnel-url>
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Architecture
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
+```
+GitHub Webhook -> Operator (webhook handler, port 8082)
+                    |
+              ClaudeTask CR created
+                    |
+              SandboxClaim -> agent-sandbox warm pool -> Pod ready
+                    |
+              PTY connection (WebSocket, port 7681)
+                    |
+              Claude Code CLI runs autonomously
+                    |
+              PR created -> GitHub comment -> Sandbox released
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+### CRDs
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+- **ClaudeRepository** - allowlist of repos the bot can work on
+- **ClaudeTask** - represents a single task (issue solve or PR review fix)
 
-```sh
-kubectl delete -k config/samples/
+### Key Makefile targets
+
+```bash
+make build           # Build the operator binary
+make docker-build    # Build the Docker image
+make helm-lint       # Lint the Helm chart
+make helm-template   # Render Helm templates
+make kind-setup      # Setup KIND cluster
+make kind-load       # Load images into KIND
 ```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/claude-town:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/claude-town/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-operator-sdk edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
 
 ## License
 
@@ -132,4 +147,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
