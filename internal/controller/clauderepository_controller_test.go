@@ -69,8 +69,9 @@ var _ = Describe("ClaudeRepository Controller", func() {
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &ClaudeRepositoryReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				Allowlist: NewAllowlistCache(),
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{

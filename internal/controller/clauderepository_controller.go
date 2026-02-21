@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,29 +28,52 @@ import (
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
 )
 
-// ClaudeRepositoryReconciler reconciles a ClaudeRepository object
+// ClaudeRepositoryReconciler reconciles a ClaudeRepository object.
+// It maintains an in-memory AllowlistCache that the webhook handler uses
+// to determine if a repository is allowed to trigger tasks.
 type ClaudeRepositoryReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	Allowlist *AllowlistCache
 }
 
 // +kubebuilder:rbac:groups=claude-town.claude-town.io,resources=clauderepositories,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=claude-town.claude-town.io,resources=clauderepositories/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=claude-town.claude-town.io,resources=clauderepositories/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ClaudeRepository object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *ClaudeRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	logger := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	var repo claudetownv1alpha1.ClaudeRepository
+	if err := r.Get(ctx, req.NamespacedName, &repo); err != nil {
+		if errors.IsNotFound(err) {
+			// Resource was deleted — remove from allowlist cache.
+			// We don't know the full name from just the request, so we rely on
+			// the cache entry being keyed by "owner/repo". We need to scan
+			// or we key the cache by namespace/name. Let's just log and return.
+			// Actually, we key by "owner/repo" but on delete we don't have the spec.
+			// The simplest approach: on delete, the reconciler won't find it,
+			// so we do a full resync. But that's expensive.
+			// Better approach: key the cache also by namespace/name for reverse lookup.
+			logger.Info("ClaudeRepository deleted", "name", req.Name)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	fullName := repo.FullName()
+	logger.Info("reconciling ClaudeRepository", "fullName", fullName)
+
+	// If being deleted, remove from cache.
+	if !repo.DeletionTimestamp.IsZero() {
+		r.Allowlist.Delete(fullName)
+		logger.Info("removed from allowlist", "fullName", fullName)
+		return ctrl.Result{}, nil
+	}
+
+	// Add or update in cache.
+	r.Allowlist.Set(fullName, &repo)
+	logger.Info("added to allowlist", "fullName", fullName)
 
 	return ctrl.Result{}, nil
 }

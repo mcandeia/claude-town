@@ -17,20 +17,27 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -39,6 +46,9 @@ import (
 
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
 	"github.com/marcoscandeia/claude-town/internal/controller"
+	ghclient "github.com/marcoscandeia/claude-town/internal/github"
+	"github.com/marcoscandeia/claude-town/internal/sandbox"
+	webhookhandler "github.com/marcoscandeia/claude-town/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -52,6 +62,36 @@ func init() {
 
 	utilruntime.Must(claudetownv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+}
+
+// taskCreator implements webhookhandler.TaskCreator by creating ClaudeTask CRs
+// in the cluster and delegating allowlist checks to the shared AllowlistCache.
+type taskCreator struct {
+	client    ctrlclient.Client
+	namespace string
+	allowlist *controller.AllowlistCache
+}
+
+func (tc *taskCreator) CreateTask(ctx context.Context, req webhookhandler.TaskRequest) error {
+	task := &claudetownv1alpha1.ClaudeTask{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-%s-", req.Owner, req.Repo),
+			Namespace:    tc.namespace,
+		},
+		Spec: claudetownv1alpha1.ClaudeTaskSpec{
+			Repository:  fmt.Sprintf("%s/%s", req.Owner, req.Repo),
+			Issue:       req.Issue,
+			PullRequest: req.PullRequest,
+			TaskType:    claudetownv1alpha1.ClaudeTaskType(req.TaskType),
+			Branch:      req.Branch,
+		},
+	}
+
+	return tc.client.Create(ctx, task)
+}
+
+func (tc *taskCreator) IsRepoAllowed(_ context.Context, owner, repo string) (bool, error) {
+	return tc.allowlist.IsAllowed(fmt.Sprintf("%s/%s", owner, repo)), nil
 }
 
 // nolint:gocyclo
@@ -88,6 +128,21 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// --- Read configuration from environment variables ---
+	ghAppIDStr := os.Getenv("GITHUB_APP_ID")
+	ghInstallIDStr := os.Getenv("GITHUB_INSTALLATION_ID")
+	ghPrivateKey := os.Getenv("GITHUB_PRIVATE_KEY")
+	ghWebhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	ghBotName := envOrDefault("GITHUB_BOT_NAME", "claude-town")
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	selfDNS := os.Getenv("SELF_DNS")
+	sandboxNamespace := envOrDefault("SANDBOX_NAMESPACE", "claude-town-system")
+	sandboxTemplateName := envOrDefault("SANDBOX_TEMPLATE_NAME", "claude-sandbox")
+	webhookPort := envOrDefault("WEBHOOK_PORT", "8082")
+
+	ghAppID, _ := strconv.ParseInt(ghAppIDStr, 10, 64)
+	ghInstallID, _ := strconv.ParseInt(ghInstallIDStr, 10, 64)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -154,11 +209,6 @@ func main() {
 	// If the certificate is not specified, controller-runtime will automatically
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -185,39 +235,74 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "103dbcae.claude-town.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
+	// --- Create GitHub client ---
+	var githubClient *ghclient.Client
+	if ghAppID > 0 && ghInstallID > 0 && ghPrivateKey != "" {
+		githubClient, err = ghclient.NewClient(ghclient.Config{
+			AppID:          ghAppID,
+			InstallationID: ghInstallID,
+			PrivateKey:     []byte(ghPrivateKey),
+			WebhookSecret:  ghWebhookSecret,
+			SelfDNS:        selfDNS,
+			BotName:        ghBotName,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to create GitHub client")
+			os.Exit(1)
+		}
+
+		// Register webhook on startup.
+		if selfDNS != "" {
+			setupLog.Info("registering GitHub webhook", "url", fmt.Sprintf("https://%s/webhooks/github", selfDNS))
+			if err := githubClient.RegisterWebhook(context.Background()); err != nil {
+				setupLog.Error(err, "failed to register GitHub webhook (non-fatal)")
+			}
+		}
+	} else {
+		setupLog.Info("GitHub App credentials not fully configured, running without GitHub integration")
+	}
+
+	// --- Create dynamic client for sandbox operations ---
+	dynClient, err := dynamic.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create dynamic client")
+		os.Exit(1)
+	}
+	sandboxClient := sandbox.NewClient(dynClient, sandboxNamespace)
+
+	// --- Create shared allowlist cache ---
+	allowlist := controller.NewAllowlistCache()
+
+	// --- Register controllers ---
 	if err := (&controller.ClaudeTaskReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		SandboxClient:       sandboxClient,
+		GitHubClient:        githubClient,
+		Allowlist:           allowlist,
+		SandboxTemplateName: sandboxTemplateName,
+		AnthropicAPIKey:     anthropicKey,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClaudeTask")
 		os.Exit(1)
 	}
 	if err := (&controller.ClaudeRepositoryReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Allowlist: allowlist,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClaudeRepository")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 
+	// --- Certificate watchers ---
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
 		if err := mgr.Add(metricsCertWatcher); err != nil {
@@ -234,6 +319,7 @@ func main() {
 		}
 	}
 
+	// --- Health checks ---
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -243,9 +329,47 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- Start webhook HTTP server ---
+	creator := &taskCreator{
+		client:    mgr.GetClient(),
+		namespace: sandboxNamespace,
+		allowlist: allowlist,
+	}
+
+	webhookHandler := webhookhandler.NewHandler(ghWebhookSecret, ghBotName, creator)
+
+	mux := http.NewServeMux()
+	mux.Handle("/webhooks/github", webhookHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	webhookHTTPServer := &http.Server{
+		Addr:    ":" + webhookPort,
+		Handler: mux,
+	}
+
+	go func() {
+		setupLog.Info("starting webhook HTTP server", "port", webhookPort)
+		if err := webhookHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			setupLog.Error(err, "webhook HTTP server failed")
+			os.Exit(1)
+		}
+	}()
+
+	// --- Start manager ---
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// envOrDefault returns the value of the environment variable named by key,
+// or defaultValue if the variable is not set or empty.
+func envOrDefault(key, defaultValue string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultValue
 }
