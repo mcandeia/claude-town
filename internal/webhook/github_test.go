@@ -32,6 +32,9 @@ type mockCreator struct {
 	createCalled bool
 	lastRequest  TaskRequest
 	createErr    error
+	resumeCalled bool
+	resumeResult bool
+	resumeErr    error
 }
 
 func (m *mockCreator) CreateTask(_ context.Context, req TaskRequest) error {
@@ -42,6 +45,12 @@ func (m *mockCreator) CreateTask(_ context.Context, req TaskRequest) error {
 
 func (m *mockCreator) IsRepoAllowed(_ context.Context, _, _ string) (bool, error) {
 	return m.allowed, m.allowedErr
+}
+
+func (m *mockCreator) ResumeClarification(_ context.Context, req TaskRequest) (bool, error) {
+	m.resumeCalled = true
+	m.lastRequest = req
+	return m.resumeResult, m.resumeErr
 }
 
 func TestParseMention(t *testing.T) {

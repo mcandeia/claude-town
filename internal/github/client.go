@@ -73,6 +73,11 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
+// BotName returns the configured bot name for this GitHub App.
+func (c *Client) BotName() string {
+	return c.config.BotName
+}
+
 // RegisterWebhook updates the GitHub App's webhook configuration to point at
 // this service's webhook endpoint. It sets the URL, content type, and secret.
 //

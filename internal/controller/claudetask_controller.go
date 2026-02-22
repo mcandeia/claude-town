@@ -51,8 +51,15 @@ const (
 	sandboxContainerName = "claude"
 
 	// Completion markers output by Claude.
-	markerComplete = ":::TASK_COMPLETE:::"
-	markerFailed   = ":::TASK_FAILED:::"
+	markerComplete      = ":::TASK_COMPLETE:::"
+	markerFailed        = ":::TASK_FAILED:::"
+	markerClarification = ":::CLARIFICATION:::"
+
+	// Default max clarification rounds when spec value is 0.
+	defaultMaxClarifications = 3
+
+	// How long to wait for a user's clarification reply before timing out.
+	clarificationWaitTimeout = 24 * time.Hour
 )
 
 // ClaudeTaskReconciler reconciles a ClaudeTask object.
@@ -102,6 +109,8 @@ func (r *ClaudeTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return r.reconcilePending(ctx, &task)
 	case claudetownv1alpha1.ClaudeTaskPhaseRunning:
 		return r.reconcileRunning(ctx, &task)
+	case claudetownv1alpha1.ClaudeTaskPhaseWaitingForClarification:
+		return r.reconcileWaitingForClarification(ctx, &task)
 	case claudetownv1alpha1.ClaudeTaskPhaseCompleted, claudetownv1alpha1.ClaudeTaskPhaseFailed:
 		// Terminal states — nothing to do.
 		return ctrl.Result{}, nil
@@ -154,6 +163,22 @@ func (r *ClaudeTaskReconciler) reconcilePending(ctx context.Context, task *claud
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// reconcileWaitingForClarification handles the WaitingForClarification phase:
+// checks timeout (24h) and requeues periodically until the webhook resumes the task.
+func (r *ClaudeTaskReconciler) reconcileWaitingForClarification(ctx context.Context, task *claudetownv1alpha1.ClaudeTask) (ctrl.Result, error) {
+	logger := logf.FromContext(ctx)
+
+	if task.Status.StartTime != nil {
+		elapsed := time.Since(task.Status.StartTime.Time)
+		if elapsed > clarificationWaitTimeout {
+			return r.failTask(ctx, task, "clarification wait timed out after 24h")
+		}
+	}
+
+	logger.Info("waiting for clarification response", "clarifications", len(task.Status.Clarifications))
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
 // reconcileRunning handles the Running phase: waits for sandbox, executes
 // Claude via kubectl exec, and transitions to Completed or Failed.
 func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claudetownv1alpha1.ClaudeTask) (ctrl.Result, error) {
@@ -187,6 +212,13 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		logger.Info("sandbox ready", "podName", readyResult.PodName)
 	}
 
+	// Detect if this is a resume after clarification.
+	isResume := false
+	if n := len(task.Status.Clarifications); n > 0 && task.Status.Clarifications[n-1].Answer != "" {
+		isResume = true
+		logger.Info("resuming after clarification", "round", n)
+	}
+
 	// Get GitHub installation token for git operations.
 	token, err := r.GitHubClient.GetInstallationToken(ctx)
 	if err != nil {
@@ -198,15 +230,21 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 
 	// Build the command sequence.
 	prompt := r.buildPrompt(task, threadContext)
-	command := r.buildCommand(owner, repo, token, task, prompt)
+	command := r.buildCommand(owner, repo, token, task, prompt, isResume)
 
-	logger.Info("executing Claude command via exec", "repository", task.Spec.Repository, "pod", task.Status.PodName)
+	logger.Info("executing Claude command via exec", "repository", task.Spec.Repository, "pod", task.Status.PodName, "resume", isResume)
 
 	// Execute command via kubectl exec and wait for completion.
 	execCtx, execCancel := context.WithTimeout(ctx, taskExecutionTimeout)
 	defer execCancel()
 
 	output, err := r.execInPod(execCtx, task.Status.PodName, command)
+
+	// Check for clarification marker BEFORE failure/completion markers.
+	if question := parseClarification(output); question != "" {
+		return r.handleClarification(ctx, task, owner, repo, question)
+	}
+
 	if err != nil {
 		if strings.Contains(output, markerFailed) {
 			return r.failTask(ctx, task, "Claude reported task failure")
@@ -287,6 +325,41 @@ func (r *ClaudeTaskReconciler) execInPod(ctx context.Context, podName, command s
 	}
 
 	return output, nil
+}
+
+// handleClarification transitions the task to WaitingForClarification, appends the
+// question to the clarification history, and posts the question on GitHub.
+func (r *ClaudeTaskReconciler) handleClarification(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo, question string) (ctrl.Result, error) {
+	logger := logf.FromContext(ctx)
+
+	maxRounds := task.Spec.MaxClarifications
+	if maxRounds == 0 {
+		maxRounds = defaultMaxClarifications
+	}
+	if len(task.Status.Clarifications) >= maxRounds {
+		return r.failTask(ctx, task, fmt.Sprintf("exceeded max clarification rounds (%d)", maxRounds))
+	}
+
+	task.Status.Clarifications = append(task.Status.Clarifications, claudetownv1alpha1.ClarificationExchange{
+		Question: question,
+	})
+	task.Status.Phase = claudetownv1alpha1.ClaudeTaskPhaseWaitingForClarification
+	if err := r.Status().Update(ctx, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating task status to WaitingForClarification: %w", err)
+	}
+
+	// Post the question on GitHub.
+	botName := ""
+	if r.GitHubClient != nil {
+		botName = r.GitHubClient.BotName()
+	}
+	comment := fmt.Sprintf("**Claude needs clarification to continue:**\n\n> %s\n\nPlease reply mentioning @%s with your answer.", question, botName)
+	if err := r.commentOnTask(ctx, task, owner, repo, comment); err != nil {
+		logger.Error(err, "failed to post clarification question on GitHub")
+	}
+
+	logger.Info("task waiting for clarification", "round", len(task.Status.Clarifications), "question", question)
+	return ctrl.Result{}, nil
 }
 
 // failTask transitions the task to Failed, comments on GitHub, and cleans up.
@@ -374,13 +447,32 @@ func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, task *cla
 }
 
 // buildPrompt constructs the prompt for Claude based on the task type.
+// If there are previous clarification exchanges, they are included between
+// the Context and Task sections.
 func (r *ClaudeTaskReconciler) buildPrompt(task *claudetownv1alpha1.ClaudeTask, threadContext string) string {
 	var sb strings.Builder
 
 	if threadContext != "" {
 		sb.WriteString("# Context\n\n")
 		sb.WriteString(threadContext)
-		sb.WriteString("\n---\n\n# Task\n\n")
+		sb.WriteString("\n\n")
+	}
+
+	// Include clarification history if present.
+	if len(task.Status.Clarifications) > 0 {
+		sb.WriteString("# Previous Clarification Exchanges\n\n")
+		for i, c := range task.Status.Clarifications {
+			fmt.Fprintf(&sb, "## Round %d\n", i+1)
+			fmt.Fprintf(&sb, "**Your question:** %s\n", c.Question)
+			if c.Answer != "" {
+				fmt.Fprintf(&sb, "**User's answer:** %s\n", c.Answer)
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if threadContext != "" || len(task.Status.Clarifications) > 0 {
+		sb.WriteString("---\n\n# Task\n\n")
 	}
 
 	if task.Spec.Prompt != "" {
@@ -401,8 +493,9 @@ func (r *ClaudeTaskReconciler) buildPrompt(task *claudetownv1alpha1.ClaudeTask, 
 }
 
 // buildCommand constructs the full shell command to set up the environment
-// and run Claude inside the sandbox.
-func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *claudetownv1alpha1.ClaudeTask, prompt string) string {
+// and run Claude inside the sandbox. When isResume is true the repo is
+// already cloned so we cd into it and pull instead of cloning.
+func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *claudetownv1alpha1.ClaudeTask, prompt string, isResume bool) string {
 	var sb strings.Builder
 
 	// Set environment variables.
@@ -410,10 +503,16 @@ func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *cla
 	fmt.Fprintf(&sb, "export GITHUB_TOKEN='%s'\n", token)
 	fmt.Fprintf(&sb, "export ANTHROPIC_API_KEY='%s'\n", r.AnthropicAPIKey)
 
-	// Clone the repository.
-	cloneURL := fmt.Sprintf("https://x-access-token:${GITHUB_TOKEN}@github.com/%s/%s.git", owner, repo)
-	fmt.Fprintf(&sb, "git clone %s repo\n", cloneURL)
-	sb.WriteString("cd repo\n")
+	if isResume {
+		// Repo was already cloned in a previous run — just pull latest changes.
+		sb.WriteString("cd repo\n")
+		sb.WriteString("git pull\n")
+	} else {
+		// Clone the repository.
+		cloneURL := fmt.Sprintf("https://x-access-token:${GITHUB_TOKEN}@github.com/%s/%s.git", owner, repo)
+		fmt.Fprintf(&sb, "git clone %s repo\n", cloneURL)
+		sb.WriteString("cd repo\n")
+	}
 
 	// For PR review fixes, checkout the PR branch.
 	if task.Spec.TaskType == claudetownv1alpha1.ClaudeTaskTypePRReviewFix && task.Spec.Branch != "" {
@@ -426,6 +525,23 @@ func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *cla
 	fmt.Fprintf(&sb, "claude --print --dangerously-skip-permissions '%s'\n", escapedPrompt)
 
 	return sb.String()
+}
+
+// parseClarification extracts the question text after the :::CLARIFICATION::: marker.
+func parseClarification(output string) string {
+	idx := strings.Index(output, markerClarification)
+	if idx == -1 {
+		return ""
+	}
+	rest := output[idx+len(markerClarification):]
+	rest = strings.TrimSpace(rest)
+	// Take everything until the next marker or end of output.
+	for _, m := range []string{markerComplete, markerFailed, ":::PR_URL:::"} {
+		if i := strings.Index(rest, m); i != -1 {
+			rest = rest[:i]
+		}
+	}
+	return strings.TrimSpace(rest)
 }
 
 // parsePRURL extracts a pull request URL from output that contains the

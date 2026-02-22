@@ -66,6 +66,13 @@ spec:
                   with an issue)
                 minimum: 0
                 type: integer
+              maxClarifications:
+                default: 3
+                description: MaxClarifications is the maximum number of clarification
+                  rounds allowed.
+                maximum: 10
+                minimum: 0
+                type: integer
               maxIterations:
                 default: 10
                 description: MaxIterations is the maximum Claude iteration loops
@@ -101,6 +108,20 @@ spec:
           status:
             description: ClaudeTaskStatus defines the observed state of ClaudeTask.
             properties:
+              clarifications:
+                description: Clarifications records the clarification Q&A exchanges.
+                items:
+                  description: ClarificationExchange records a single clarification
+                    Q&A round.
+                  properties:
+                    answer:
+                      type: string
+                    question:
+                      type: string
+                  required:
+                  - question
+                  type: object
+                type: array
               completionTime:
                 description: CompletionTime is when the task completed
                 format: date-time

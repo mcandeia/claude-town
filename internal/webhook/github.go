@@ -36,19 +36,23 @@ type TaskCreator interface {
 	CreateTask(ctx context.Context, req TaskRequest) error
 	// IsRepoAllowed checks whether the given owner/repo has a ClaudeRepository resource.
 	IsRepoAllowed(ctx context.Context, owner, repo string) (bool, error)
+	// ResumeClarification checks if a WaitingForClarification task exists for the
+	// given repo+issue and, if so, fills in the answer and resumes it.
+	ResumeClarification(ctx context.Context, req TaskRequest) (bool, error)
 }
 
 // TaskRequest holds the information extracted from a GitHub webhook event
 // needed to create a ClaudeTask.
 type TaskRequest struct {
-	Owner           string
-	Repo            string
-	Issue           int
-	PullRequest     int
-	TaskType        string
-	Branch          string
-	Prompt          string
-	ReviewCommentID int64
+	Owner               string
+	Repo                string
+	Issue               int
+	PullRequest         int
+	TaskType            string
+	Branch              string
+	Prompt              string
+	ReviewCommentID     int64
+	ClarificationAnswer string
 }
 
 // Handler is an http.Handler that processes GitHub webhook events.
@@ -70,6 +74,11 @@ func NewHandler(webhookSecret, botName string, creator TaskCreator) *Handler {
 // HasBotMention returns true if body contains "@botName".
 func HasBotMention(body, botName string) bool {
 	return strings.Contains(body, "@"+botName)
+}
+
+// isBotComment returns true if the comment author is the bot itself.
+func isBotComment(login, botName string) bool {
+	return login == botName || login == botName+"[bot]"
 }
 
 // ServeHTTP implements http.Handler. It validates the request method, reads the
@@ -117,6 +126,9 @@ type issueCommentEvent struct {
 	Action  string `json:"action"`
 	Comment struct {
 		Body string `json:"body"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
 	} `json:"comment"`
 	Issue struct {
 		Number      int `json:"number"`
@@ -153,6 +165,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	// Ignore comments from the bot itself.
+	if isBotComment(event.Comment.User.Login, h.botName) {
+		logger.Info("ignoring bot's own comment")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	owner := event.Repository.Owner.Login
 	repo := event.Repository.Name
 
@@ -168,10 +187,24 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	// Try to resume a task waiting for clarification.
+	issueNum := event.Issue.Number
+	resumed, err := h.creator.ResumeClarification(ctx, TaskRequest{
+		Owner: owner, Repo: repo, Issue: issueNum,
+		ClarificationAnswer: event.Comment.Body,
+	})
+	if err != nil {
+		logger.Error(err, "failed to check for clarification task")
+	} else if resumed {
+		logger.Info("resumed clarification task", "owner", owner, "repo", repo, "issue", issueNum)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	req := TaskRequest{
 		Owner:    owner,
 		Repo:     repo,
-		Issue:    event.Issue.Number,
+		Issue:    issueNum,
 		TaskType: "IssueSolve",
 	}
 
@@ -191,6 +224,9 @@ type pullRequestReviewEvent struct {
 	Action string `json:"action"`
 	Review struct {
 		Body string `json:"body"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
 	} `json:"review"`
 	PullRequest struct {
 		Number int `json:"number"`
@@ -227,6 +263,13 @@ func (h *Handler) handlePRReview(ctx context.Context, w http.ResponseWriter, bod
 		return
 	}
 
+	// Ignore reviews from the bot itself.
+	if isBotComment(event.Review.User.Login, h.botName) {
+		logger.Info("ignoring bot's own review")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	owner := event.Repository.Owner.Login
 	repo := event.Repository.Name
 
@@ -242,10 +285,24 @@ func (h *Handler) handlePRReview(ctx context.Context, w http.ResponseWriter, bod
 		return
 	}
 
+	// Try to resume a task waiting for clarification.
+	prNum := event.PullRequest.Number
+	resumed, err := h.creator.ResumeClarification(ctx, TaskRequest{
+		Owner: owner, Repo: repo, PullRequest: prNum,
+		ClarificationAnswer: event.Review.Body,
+	})
+	if err != nil {
+		logger.Error(err, "failed to check for clarification task")
+	} else if resumed {
+		logger.Info("resumed clarification task", "owner", owner, "repo", repo, "pr", prNum)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	req := TaskRequest{
 		Owner:       owner,
 		Repo:        repo,
-		PullRequest: event.PullRequest.Number,
+		PullRequest: prNum,
 		TaskType:    "PRReviewFix",
 		Branch:      event.PullRequest.Head.Ref,
 	}
@@ -270,6 +327,9 @@ type pullRequestReviewCommentEvent struct {
 		Path     string `json:"path"`
 		Line     int    `json:"line"`
 		DiffHunk string `json:"diff_hunk"`
+		User     struct {
+			Login string `json:"login"`
+		} `json:"user"`
 	} `json:"comment"`
 	PullRequest struct {
 		Number int `json:"number"`
@@ -306,6 +366,13 @@ func (h *Handler) handlePRReviewComment(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
+	// Ignore comments from the bot itself.
+	if isBotComment(event.Comment.User.Login, h.botName) {
+		logger.Info("ignoring bot's own review comment")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	owner := event.Repository.Owner.Login
 	repo := event.Repository.Name
 
@@ -317,6 +384,20 @@ func (h *Handler) handlePRReviewComment(ctx context.Context, w http.ResponseWrit
 	}
 	if !allowed {
 		logger.Info("repo not allowed", "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Try to resume a task waiting for clarification.
+	prNum := event.PullRequest.Number
+	resumed, err := h.creator.ResumeClarification(ctx, TaskRequest{
+		Owner: owner, Repo: repo, PullRequest: prNum,
+		ClarificationAnswer: event.Comment.Body,
+	})
+	if err != nil {
+		logger.Error(err, "failed to check for clarification task")
+	} else if resumed {
+		logger.Info("resumed clarification task", "owner", owner, "repo", repo, "pr", prNum)
 		w.WriteHeader(http.StatusOK)
 		return
 	}

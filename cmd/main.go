@@ -96,6 +96,43 @@ func (tc *taskCreator) IsRepoAllowed(_ context.Context, owner, repo string) (boo
 	return tc.allowlist.IsAllowed(fmt.Sprintf("%s/%s", owner, repo)), nil
 }
 
+func (tc *taskCreator) ResumeClarification(ctx context.Context, req webhookhandler.TaskRequest) (bool, error) {
+	var taskList claudetownv1alpha1.ClaudeTaskList
+	if err := tc.client.List(ctx, &taskList, ctrlclient.InNamespace(tc.namespace)); err != nil {
+		return false, fmt.Errorf("listing ClaudeTasks: %w", err)
+	}
+
+	fullRepo := fmt.Sprintf("%s/%s", req.Owner, req.Repo)
+	for i := range taskList.Items {
+		task := &taskList.Items[i]
+		if task.Status.Phase != claudetownv1alpha1.ClaudeTaskPhaseWaitingForClarification {
+			continue
+		}
+		if task.Spec.Repository != fullRepo {
+			continue
+		}
+		// Match by issue or PR number.
+		if req.Issue > 0 && task.Spec.Issue != req.Issue {
+			continue
+		}
+		if req.PullRequest > 0 && task.Spec.PullRequest != req.PullRequest {
+			continue
+		}
+
+		// Fill in the answer on the last clarification exchange.
+		if len(task.Status.Clarifications) > 0 {
+			task.Status.Clarifications[len(task.Status.Clarifications)-1].Answer = req.ClarificationAnswer
+		}
+		task.Status.Phase = claudetownv1alpha1.ClaudeTaskPhaseRunning
+		if err := tc.client.Status().Update(ctx, task); err != nil {
+			return false, fmt.Errorf("updating task status: %w", err)
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string

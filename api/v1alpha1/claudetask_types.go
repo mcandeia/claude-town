@@ -33,11 +33,18 @@ const (
 type ClaudeTaskPhase string
 
 const (
-	ClaudeTaskPhasePending   ClaudeTaskPhase = "Pending"
-	ClaudeTaskPhaseRunning   ClaudeTaskPhase = "Running"
-	ClaudeTaskPhaseCompleted ClaudeTaskPhase = "Completed"
-	ClaudeTaskPhaseFailed    ClaudeTaskPhase = "Failed"
+	ClaudeTaskPhasePending                 ClaudeTaskPhase = "Pending"
+	ClaudeTaskPhaseRunning                 ClaudeTaskPhase = "Running"
+	ClaudeTaskPhaseWaitingForClarification ClaudeTaskPhase = "WaitingForClarification"
+	ClaudeTaskPhaseCompleted               ClaudeTaskPhase = "Completed"
+	ClaudeTaskPhaseFailed                  ClaudeTaskPhase = "Failed"
 )
+
+// ClarificationExchange records a single clarification Q&A round.
+type ClarificationExchange struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer,omitempty"`
+}
 
 // ClaudeTaskSpec defines the desired state of ClaudeTask.
 type ClaudeTaskSpec struct {
@@ -76,6 +83,12 @@ type ClaudeTaskSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=50
 	MaxIterations int `json:"maxIterations,omitempty"`
+
+	// MaxClarifications is the maximum number of clarification rounds allowed.
+	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	MaxClarifications int `json:"maxClarifications,omitempty"`
 }
 
 // CostReport contains token usage and cost information
@@ -115,6 +128,10 @@ type ClaudeTaskStatus struct {
 
 	// CostReport contains token usage and cost info
 	CostReport *CostReport `json:"costReport,omitempty"`
+
+	// Clarifications records the clarification Q&A exchanges.
+	// +optional
+	Clarifications []ClarificationExchange `json:"clarifications,omitempty"`
 
 	// Conditions represent the latest available observations
 	// +optional
