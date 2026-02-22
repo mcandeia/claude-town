@@ -186,6 +186,20 @@ spec:
               costReport:
                 description: CostReport contains token usage and cost info
                 properties:
+                  cacheCreationInputTokens:
+                    description: CacheCreationInputTokens is the total cache creation
+                      input tokens used
+                    format: int64
+                    type: integer
+                  cacheReadInputTokens:
+                    description: CacheReadInputTokens is the total cache read input
+                      tokens used
+                    format: int64
+                    type: integer
+                  durationMs:
+                    description: DurationMs is the total execution duration in milliseconds
+                    format: int64
+                    type: integer
                   estimatedCost:
                     description: EstimatedCost is the estimated cost in USD
                     type: string

@@ -99,8 +99,17 @@ type CostReport struct {
 	// OutputTokens is the total output tokens used
 	OutputTokens int64 `json:"outputTokens,omitempty"`
 
+	// CacheReadInputTokens is the total cache read input tokens used
+	CacheReadInputTokens int64 `json:"cacheReadInputTokens,omitempty"`
+
+	// CacheCreationInputTokens is the total cache creation input tokens used
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
+
 	// EstimatedCost is the estimated cost in USD
 	EstimatedCost string `json:"estimatedCost,omitempty"`
+
+	// DurationMs is the total execution duration in milliseconds
+	DurationMs int64 `json:"durationMs,omitempty"`
 }
 
 // ClaudeTaskStatus defines the observed state of ClaudeTask.

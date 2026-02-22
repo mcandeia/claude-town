@@ -70,6 +70,12 @@ var _ = Describe("ClaudeTask Controller", func() {
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 		It("should successfully reconcile the resource", func() {
+			By("Setting status to Completed so reconcile is a no-op")
+			resource := &claudetownv1alpha1.ClaudeTask{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Status.Phase = claudetownv1alpha1.ClaudeTaskPhaseCompleted
+			Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+
 			By("Reconciling the created resource")
 			controllerReconciler := &ClaudeTaskReconciler{
 				Client: k8sClient,
@@ -80,8 +86,6 @@ var _ = Describe("ClaudeTask Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
 		})
 	})
 })

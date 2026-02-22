@@ -80,6 +80,39 @@ To fix PR review feedback:
 
 > @your-bot-name please address this review
 
+## Clarification
+
+When Claude needs more information to complete a task, it will ask a clarification question directly on the GitHub issue or PR:
+
+> **Claude needs clarification to continue:**
+>
+> Should I implement this as a REST endpoint or a GraphQL mutation?
+>
+> Please reply mentioning @your-bot-name with your answer.
+
+Reply with your answer mentioning the bot, and Claude will resume working with the additional context. This loop can repeat up to `maxClarifications` rounds (default: 3, configurable per-task up to 10).
+
+If no response is received within 24 hours, the task times out and is marked as failed.
+
+## Cost Reporting
+
+Each GitHub comment (completion, failure, and clarification) includes a cost summary:
+
+> 📊 **Cost:** $0.1400 | **Tokens:** 15000 in / 3000 out | **Duration:** 45.2s
+
+Costs accumulate across clarification rounds so you always see the running total. The full cost breakdown is also stored in the `ClaudeTask` status:
+
+```yaml
+status:
+  costReport:
+    inputTokens: 15000
+    outputTokens: 3000
+    cacheReadInputTokens: 8000
+    cacheCreationInputTokens: 2000
+    estimatedCost: "$0.1400"
+    durationMs: 45200
+```
+
 ## Local Development
 
 ```bash

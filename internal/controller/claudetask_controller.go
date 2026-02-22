@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -240,25 +241,33 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 
 	output, err := r.execInPod(execCtx, task.Status.PodName, command)
 
+	// Parse JSON output from Claude CLI.
+	cr, resultText := parseClaudeOutput(output)
+	task.Status.CostReport = accumulateCost(task.Status.CostReport, cr)
+
 	// Check for clarification marker BEFORE failure/completion markers.
-	if question := parseClarification(output); question != "" {
+	if question := parseClarification(resultText); question != "" {
+		// Save accumulated cost before transitioning to clarification.
+		if updateErr := r.Status().Update(ctx, task); updateErr != nil {
+			logger.Error(updateErr, "failed to save cost report before clarification")
+		}
 		return r.handleClarification(ctx, task, owner, repo, question)
 	}
 
 	if err != nil {
-		if strings.Contains(output, markerFailed) {
+		if strings.Contains(resultText, markerFailed) {
 			return r.failTask(ctx, task, "Claude reported task failure")
 		}
 		return r.failTask(ctx, task, fmt.Sprintf("task execution error: %v", err))
 	}
 
 	// Check for failure marker in output even if exec succeeded.
-	if strings.Contains(output, markerFailed) && !strings.Contains(output, markerComplete) {
+	if strings.Contains(resultText, markerFailed) && !strings.Contains(resultText, markerComplete) {
 		return r.failTask(ctx, task, "Claude reported task failure")
 	}
 
 	// Parse PR URL from output.
-	prURL := parsePRURL(output)
+	prURL := parsePRURL(resultText)
 
 	// Update status to Completed.
 	now := metav1.Now()
@@ -276,6 +285,7 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 	if prURL != "" {
 		completionComment += fmt.Sprintf("\n\nPull Request: %s", prURL)
 	}
+	completionComment += formatCostReport(task.Status.CostReport)
 	if err := r.commentOnTask(ctx, task, owner, repo, completionComment); err != nil {
 		logger.Error(err, "failed to comment completion")
 	}
@@ -354,6 +364,7 @@ func (r *ClaudeTaskReconciler) handleClarification(ctx context.Context, task *cl
 		botName = r.GitHubClient.BotName()
 	}
 	comment := fmt.Sprintf("**Claude needs clarification to continue:**\n\n> %s\n\nPlease reply mentioning @%s with your answer.", question, botName)
+	comment += formatCostReport(task.Status.CostReport)
 	if err := r.commentOnTask(ctx, task, owner, repo, comment); err != nil {
 		logger.Error(err, "failed to post clarification question on GitHub")
 	}
@@ -378,6 +389,7 @@ func (r *ClaudeTaskReconciler) failTask(ctx context.Context, task *claudetownv1a
 	parts := strings.SplitN(task.Spec.Repository, "/", 2)
 	if len(parts) == 2 {
 		failComment := fmt.Sprintf("Claude failed to complete the task.\n\nReason: %s", reason)
+		failComment += formatCostReport(task.Status.CostReport)
 		if err := r.commentOnTask(ctx, task, parts[0], parts[1], failComment); err != nil {
 			logger.Error(err, "failed to comment failure")
 		}
@@ -522,7 +534,7 @@ func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *cla
 	// Run Claude with the prompt. Use --print and --dangerously-skip-permissions
 	// for autonomous execution.
 	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
-	fmt.Fprintf(&sb, "claude --print --dangerously-skip-permissions '%s'\n", escapedPrompt)
+	fmt.Fprintf(&sb, "claude --print --output-format json --dangerously-skip-permissions '%s'\n", escapedPrompt)
 
 	return sb.String()
 }
@@ -533,15 +545,15 @@ func parseClarification(output string) string {
 	if idx == -1 {
 		return ""
 	}
-	rest := output[idx+len(markerClarification):]
-	rest = strings.TrimSpace(rest)
+	remaining := output[idx+len(markerClarification):]
+	remaining = strings.TrimSpace(remaining)
 	// Take everything until the next marker or end of output.
 	for _, m := range []string{markerComplete, markerFailed, ":::PR_URL:::"} {
-		if i := strings.Index(rest, m); i != -1 {
-			rest = rest[:i]
+		if i := strings.Index(remaining, m); i != -1 {
+			remaining = remaining[:i]
 		}
 	}
-	return strings.TrimSpace(rest)
+	return strings.TrimSpace(remaining)
 }
 
 // parsePRURL extracts a pull request URL from output that contains the
@@ -553,14 +565,88 @@ func parsePRURL(output string) string {
 		return ""
 	}
 
-	rest := output[idx+len(marker):]
-	rest = strings.TrimSpace(rest)
+	remaining := output[idx+len(marker):]
+	remaining = strings.TrimSpace(remaining)
 
-	fields := strings.Fields(rest)
+	fields := strings.Fields(remaining)
 	if len(fields) == 0 {
 		return ""
 	}
 	return fields[0]
+}
+
+// claudeResult represents the JSON output from Claude CLI with --output-format json.
+type claudeResult struct {
+	Result       string  `json:"result"`
+	IsError      bool    `json:"is_error"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	DurationMs   int64   `json:"duration_ms"`
+	Usage        struct {
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	} `json:"usage"`
+}
+
+// parseClaudeOutput extracts the Claude JSON result from raw exec output.
+// Git clone output and other text may precede the JSON object, so we find
+// the last top-level JSON object in the output. Returns the parsed struct
+// and the text result for marker parsing. On failure, returns empty struct
+// and the raw output as fallback.
+func parseClaudeOutput(output string) (claudeResult, string) {
+	// Find the last '{' that starts a top-level JSON object.
+	lastBrace := strings.LastIndex(output, "{")
+	if lastBrace == -1 {
+		return claudeResult{}, output
+	}
+
+	// Try parsing from each '{' starting from the last one, working backwards.
+	for i := lastBrace; i >= 0; i-- {
+		if output[i] != '{' {
+			continue
+		}
+		candidate := output[i:]
+		var cr claudeResult
+		if err := json.Unmarshal([]byte(candidate), &cr); err == nil {
+			return cr, cr.Result
+		}
+	}
+
+	return claudeResult{}, output
+}
+
+// accumulateCost adds the cost from a claudeResult to an existing CostReport,
+// creating a new one if nil.
+func accumulateCost(existing *claudetownv1alpha1.CostReport, cr claudeResult) *claudetownv1alpha1.CostReport {
+	if existing == nil {
+		existing = &claudetownv1alpha1.CostReport{}
+	}
+	existing.InputTokens += cr.Usage.InputTokens
+	existing.OutputTokens += cr.Usage.OutputTokens
+	existing.CacheReadInputTokens += cr.Usage.CacheReadInputTokens
+	existing.CacheCreationInputTokens += cr.Usage.CacheCreationInputTokens
+	existing.DurationMs += cr.DurationMs
+
+	// Recalculate total cost: parse existing cost and add new.
+	var totalCost float64
+	if existing.EstimatedCost != "" {
+		fmt.Sscanf(existing.EstimatedCost, "$%f", &totalCost)
+	}
+	totalCost += cr.TotalCostUSD
+	existing.EstimatedCost = fmt.Sprintf("$%.4f", totalCost)
+
+	return existing
+}
+
+// formatCostReport returns a human-readable string for a CostReport.
+func formatCostReport(cr *claudetownv1alpha1.CostReport) string {
+	if cr == nil {
+		return ""
+	}
+	durationSec := float64(cr.DurationMs) / 1000.0
+	return fmt.Sprintf("\n\n---\n📊 **Cost:** %s | **Tokens:** %d in / %d out | **Duration:** %.1fs",
+		cr.EstimatedCost, cr.InputTokens, cr.OutputTokens, durationSec)
 }
 
 // SetupWithManager sets up the controller with the Manager.
