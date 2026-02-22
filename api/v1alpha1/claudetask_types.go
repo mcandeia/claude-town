@@ -46,10 +46,10 @@ type ClaudeTaskSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$`
 	Repository string `json:"repository"`
 
-	// Issue is the GitHub issue number
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Minimum=1
-	Issue int `json:"issue"`
+	// Issue is the GitHub issue number (0 when not associated with an issue)
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Issue int `json:"issue,omitempty"`
 
 	// PullRequest is the PR number (non-zero when fixing PR review)
 	// +optional
@@ -66,6 +66,10 @@ type ClaudeTaskSpec struct {
 	// Prompt is an optional override for the Claude prompt
 	// +optional
 	Prompt string `json:"prompt,omitempty"`
+
+	// ReviewCommentID is the GitHub PR review comment ID to reply to
+	// +optional
+	ReviewCommentID int64 `json:"reviewCommentId,omitempty"`
 
 	// MaxIterations is the maximum Claude iteration loops
 	// +kubebuilder:default=10

@@ -1,43 +1,39 @@
-{{- if .Values.installCRDs | default true }}
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: claudetasks.claude-town.claude-town.io
+  name: clauderepositories.claude-town.claude-town.io
 spec:
   group: claude-town.claude-town.io
   names:
-    kind: ClaudeTask
-    listKind: ClaudeTaskList
-    plural: claudetasks
-    singular: claudetask
+    kind: ClaudeRepository
+    listKind: ClaudeRepositoryList
+    plural: clauderepositories
+    singular: clauderepository
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.repository
-      name: Repository
+    - jsonPath: .spec.owner
+      name: Owner
       type: string
-    - jsonPath: .spec.issue
-      name: Issue
+    - jsonPath: .spec.repo
+      name: Repo
+      type: string
+    - jsonPath: .spec.repositoryPattern
+      name: Pattern
+      type: string
+    - jsonPath: .spec.maxConcurrentTasks
+      name: Max Tasks
       type: integer
-    - jsonPath: .spec.taskType
-      name: Type
-      type: string
-    - jsonPath: .status.phase
-      name: Phase
-      type: string
-    - jsonPath: .status.pullRequestURL
-      name: PR
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
+    - jsonPath: .status.activeTasks
+      name: Active
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ClaudeTask is the Schema for the claudetasks API.
+        description: ClaudeRepository is the Schema for the clauderepositories API.
         properties:
           apiVersion:
             description: |-
@@ -57,50 +53,43 @@ spec:
           metadata:
             type: object
           spec:
-            description: ClaudeTaskSpec defines the desired state of ClaudeTask.
+            description: |-
+              ClaudeRepositorySpec defines the desired state of ClaudeRepository.
+              Use Owner+Repo for exact match, or RepositoryPattern for regex matching.
             properties:
-              branch:
-                description: Branch is the git branch to work on (set for PRReviewFix)
-                type: string
-              issue:
-                description: Issue is the GitHub issue number
+              labels:
+                description: |-
+                  Labels restricts the bot to only respond on issues with these labels.
+                  Empty means all issues are allowed.
+                items:
+                  type: string
+                type: array
+              maxConcurrentTasks:
+                default: 3
+                description: MaxConcurrentTasks is the maximum number of concurrent
+                  tasks for this repo
                 minimum: 1
                 type: integer
-              maxIterations:
-                default: 10
-                description: MaxIterations is the maximum Claude iteration loops
-                maximum: 50
-                minimum: 1
-                type: integer
-              prompt:
-                description: Prompt is an optional override for the Claude prompt
+              owner:
+                description: Owner is the GitHub organization or user (exact match).
                 type: string
-              pullRequest:
-                description: PullRequest is the PR number (non-zero when fixing PR
-                  review)
-                type: integer
-              repository:
-                description: Repository is the full repo name (owner/repo)
-                pattern: ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$
+              repo:
+                description: Repo is the repository name (exact match).
                 type: string
-              taskType:
-                default: IssueSolve
-                description: TaskType specifies what kind of task this is
-                enum:
-                - IssueSolve
-                - PRReviewFix
+              repositoryPattern:
+                description: |-
+                  RepositoryPattern is a regex pattern matched against "owner/repo".
+                  When set, Owner and Repo fields are ignored for matching purposes.
+                  Examples: "my-org/.*", "my-org/frontend-.*", ".*/my-repo"
                 type: string
-            required:
-            - issue
-            - repository
             type: object
           status:
-            description: ClaudeTaskStatus defines the observed state of ClaudeTask.
+            description: ClaudeRepositoryStatus defines the observed state of ClaudeRepository.
             properties:
-              completionTime:
-                description: CompletionTime is when the task completed
-                format: date-time
-                type: string
+              activeTasks:
+                description: ActiveTasks is the current number of running tasks for
+                  this repo
+                type: integer
               conditions:
                 description: Conditions represent the latest available observations
                 items:
@@ -158,45 +147,9 @@ spec:
                   - type
                   type: object
                 type: array
-              costReport:
-                description: CostReport contains token usage and cost info
-                properties:
-                  estimatedCost:
-                    description: EstimatedCost is the estimated cost in USD
-                    type: string
-                  inputTokens:
-                    description: InputTokens is the total input tokens used
-                    format: int64
-                    type: integer
-                  outputTokens:
-                    description: OutputTokens is the total output tokens used
-                    format: int64
-                    type: integer
-                type: object
-              phase:
-                description: Phase is the current phase of the task
-                type: string
-              podIP:
-                description: PodIP is the IP address of the sandbox pod
-                type: string
-              podName:
-                description: PodName is the name of the sandbox pod
-                type: string
-              pullRequestURL:
-                description: PullRequestURL is the URL of the created PR
-                type: string
-              sandboxClaimName:
-                description: SandboxClaimName is the name of the SandboxClaim created
-                  for this task
-                type: string
-              startTime:
-                description: StartTime is when the task started running
-                format: date-time
-                type: string
             type: object
         type: object
     served: true
     storage: true
     subresources:
       status: {}
-{{- end }}

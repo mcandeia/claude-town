@@ -41,10 +41,7 @@ func TestBuildSandboxClaim(t *testing.T) {
 	}
 
 	// Verify the template ref name is set correctly.
-	templateName, found, err := extractTemplateRefName(claim.Object)
-	if err != nil {
-		t.Fatalf("error extracting template ref name: %v", err)
-	}
+	templateName, found := extractTemplateRefName(claim.Object)
 	if !found {
 		t.Fatal("sandboxTemplateRef.name not found in spec")
 	}
@@ -54,18 +51,18 @@ func TestBuildSandboxClaim(t *testing.T) {
 }
 
 // extractTemplateRefName retrieves spec.sandboxTemplateRef.name from an unstructured object.
-func extractTemplateRefName(obj map[string]interface{}) (string, bool, error) {
+func extractTemplateRefName(obj map[string]interface{}) (string, bool) {
 	spec, ok := obj["spec"].(map[string]interface{})
 	if !ok {
-		return "", false, nil
+		return "", false
 	}
 	ref, ok := spec["sandboxTemplateRef"].(map[string]interface{})
 	if !ok {
-		return "", false, nil
+		return "", false
 	}
 	name, ok := ref["name"].(string)
 	if !ok {
-		return "", false, nil
+		return "", false
 	}
-	return name, true, nil
+	return name, true
 }

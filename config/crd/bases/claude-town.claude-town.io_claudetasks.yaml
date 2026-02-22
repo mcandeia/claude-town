@@ -62,8 +62,9 @@ spec:
                 description: Branch is the git branch to work on (set for PRReviewFix)
                 type: string
               issue:
-                description: Issue is the GitHub issue number
-                minimum: 1
+                description: Issue is the GitHub issue number (0 when not associated
+                  with an issue)
+                minimum: 0
                 type: integer
               maxIterations:
                 default: 10
@@ -82,6 +83,11 @@ spec:
                 description: Repository is the full repo name (owner/repo)
                 pattern: ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$
                 type: string
+              reviewCommentId:
+                description: ReviewCommentID is the GitHub PR review comment ID to
+                  reply to
+                format: int64
+                type: integer
               taskType:
                 default: IssueSolve
                 description: TaskType specifies what kind of task this is
@@ -90,7 +96,6 @@ spec:
                 - PRReviewFix
                 type: string
             required:
-            - issue
             - repository
             type: object
           status:

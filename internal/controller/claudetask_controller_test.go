@@ -51,7 +51,10 @@ var _ = Describe("ClaudeTask Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: claudetownv1alpha1.ClaudeTaskSpec{
+						Repository: "test-org/test-repo",
+						Issue:      1,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

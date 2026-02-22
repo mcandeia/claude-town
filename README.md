@@ -109,7 +109,7 @@ GitHub Webhook -> Operator (webhook handler, port 8082)
                     |
               SandboxClaim -> agent-sandbox warm pool -> Pod ready
                     |
-              PTY connection (WebSocket, port 7681)
+              kubectl exec into sandbox pod
                     |
               Claude Code CLI runs autonomously
                     |

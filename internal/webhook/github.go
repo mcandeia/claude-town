@@ -41,12 +41,14 @@ type TaskCreator interface {
 // TaskRequest holds the information extracted from a GitHub webhook event
 // needed to create a ClaudeTask.
 type TaskRequest struct {
-	Owner       string
-	Repo        string
-	Issue       int
-	PullRequest int
-	TaskType    string
-	Branch      string
+	Owner           string
+	Repo            string
+	Issue           int
+	PullRequest     int
+	TaskType        string
+	Branch          string
+	Prompt          string
+	ReviewCommentID int64
 }
 
 // Handler is an http.Handler that processes GitHub webhook events.
@@ -80,13 +82,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defer func() { _ = r.Body.Close() }()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		logger.Error(err, "failed to read request body")
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
 
 	signature := r.Header.Get("X-Hub-Signature-256")
 	if !validateSignature(body, signature, h.webhookSecret) {
@@ -263,7 +265,11 @@ func (h *Handler) handlePRReview(ctx context.Context, w http.ResponseWriter, bod
 type pullRequestReviewCommentEvent struct {
 	Action  string `json:"action"`
 	Comment struct {
-		Body string `json:"body"`
+		ID       int64  `json:"id"`
+		Body     string `json:"body"`
+		Path     string `json:"path"`
+		Line     int    `json:"line"`
+		DiffHunk string `json:"diff_hunk"`
 	} `json:"comment"`
 	PullRequest struct {
 		Number int `json:"number"`
@@ -315,12 +321,22 @@ func (h *Handler) handlePRReviewComment(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
+	prompt := buildReviewCommentPrompt(
+		event.PullRequest.Number,
+		event.Comment.Path,
+		event.Comment.Line,
+		event.Comment.DiffHunk,
+		event.Comment.Body,
+	)
+
 	req := TaskRequest{
-		Owner:       owner,
-		Repo:        repo,
-		PullRequest: event.PullRequest.Number,
-		TaskType:    "PRReviewFix",
-		Branch:      event.PullRequest.Head.Ref,
+		Owner:           owner,
+		Repo:            repo,
+		PullRequest:     event.PullRequest.Number,
+		TaskType:        "PRReviewFix",
+		Branch:          event.PullRequest.Head.Ref,
+		Prompt:          prompt,
+		ReviewCommentID: event.Comment.ID,
 	}
 
 	if err := h.creator.CreateTask(ctx, req); err != nil {
@@ -329,8 +345,30 @@ func (h *Handler) handlePRReviewComment(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	logger.Info("created PRReviewFix task", "owner", owner, "repo", repo, "pr", req.PullRequest)
+	logger.Info("created PRReviewFix task", "owner", owner, "repo", repo, "pr", req.PullRequest, "file", event.Comment.Path)
 	w.WriteHeader(http.StatusCreated)
+}
+
+// buildReviewCommentPrompt constructs a prompt with the file, line, diff, and
+// comment context from a PR review comment.
+func buildReviewCommentPrompt(pr int, path string, line int, diffHunk, comment string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Fix the review comment on PR #%d.\n\n", pr)
+	if path != "" {
+		fmt.Fprintf(&sb, "The reviewer commented on file `%s`", path)
+		if line > 0 {
+			fmt.Fprintf(&sb, " at line %d", line)
+		}
+		sb.WriteString(":\n\n")
+	}
+	if diffHunk != "" {
+		sb.WriteString("```diff\n")
+		sb.WriteString(diffHunk)
+		sb.WriteString("\n```\n\n")
+	}
+	fmt.Fprintf(&sb, "Reviewer said: %q\n\n", comment)
+	sb.WriteString("Fix this specific issue, commit, and push to the same branch.")
+	return sb.String()
 }
 
 // validateSignature checks the HMAC-SHA256 signature of the payload.

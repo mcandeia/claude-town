@@ -33,8 +33,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/dynamic"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,7 +47,6 @@ import (
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
 	"github.com/marcoscandeia/claude-town/internal/controller"
 	ghclient "github.com/marcoscandeia/claude-town/internal/github"
-	"github.com/marcoscandeia/claude-town/internal/pty"
 	"github.com/marcoscandeia/claude-town/internal/sandbox"
 	webhookhandler "github.com/marcoscandeia/claude-town/internal/webhook"
 	// +kubebuilder:scaffold:imports
@@ -80,11 +79,13 @@ func (tc *taskCreator) CreateTask(ctx context.Context, req webhookhandler.TaskRe
 			Namespace:    tc.namespace,
 		},
 		Spec: claudetownv1alpha1.ClaudeTaskSpec{
-			Repository:  fmt.Sprintf("%s/%s", req.Owner, req.Repo),
-			Issue:       req.Issue,
-			PullRequest: req.PullRequest,
-			TaskType:    claudetownv1alpha1.ClaudeTaskType(req.TaskType),
-			Branch:      req.Branch,
+			Repository:      fmt.Sprintf("%s/%s", req.Owner, req.Repo),
+			Issue:           req.Issue,
+			PullRequest:     req.PullRequest,
+			TaskType:        claudetownv1alpha1.ClaudeTaskType(req.TaskType),
+			Branch:          req.Branch,
+			Prompt:          req.Prompt,
+			ReviewCommentID: req.ReviewCommentID,
 		},
 	}
 
@@ -244,7 +245,6 @@ func main() {
 
 	// --- Create GitHub client ---
 	var githubClient *ghclient.Client
-	setupLog.Info("GitHub config check", "appID", ghAppID, "installID", ghInstallID, "privateKeyLen", len(ghPrivateKey), "webhookSecret", ghWebhookSecret != "", "selfDNS", selfDNS)
 	if ghAppID > 0 && ghInstallID > 0 && ghPrivateKey != "" {
 		githubClient, err = ghclient.NewClient(ghclient.Config{
 			AppID:          ghAppID,
@@ -281,22 +281,16 @@ func main() {
 	// --- Create shared allowlist cache ---
 	allowlist := controller.NewAllowlistCache()
 
-	// --- Create exec client for running commands in sandbox pods ---
-	execClient, err := pty.NewExecClient(mgr.GetConfig(), sandboxNamespace)
-	if err != nil {
-		setupLog.Error(err, "unable to create exec client")
-		os.Exit(1)
-	}
-
 	// --- Register controllers ---
 	if err := (&controller.ClaudeTaskReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
+		RestConfig:          mgr.GetConfig(),
 		SandboxClient:       sandboxClient,
 		GitHubClient:        githubClient,
-		ExecClient:          execClient,
 		Allowlist:           allowlist,
 		SandboxTemplateName: sandboxTemplateName,
+		SandboxNamespace:    sandboxNamespace,
 		AnthropicAPIKey:     anthropicKey,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClaudeTask")

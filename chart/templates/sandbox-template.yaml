@@ -11,12 +11,6 @@ spec:
       containers:
         - name: claude
           image: "{{ .Values.claudeImage.repository }}:{{ .Values.claudeImage.tag }}"
-          ports:
-            - containerPort: 7681
-              name: pty
-          env:
-            - name: CLAUDE_PTY_PORT
-              value: "7681"
           resources:
             requests:
               cpu: "500m"

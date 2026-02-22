@@ -17,21 +17,26 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
 	ghclient "github.com/marcoscandeia/claude-town/internal/github"
-	"github.com/marcoscandeia/claude-town/internal/pty"
 	"github.com/marcoscandeia/claude-town/internal/sandbox"
 )
 
@@ -42,7 +47,7 @@ const (
 	// Default timeout for Claude task execution.
 	taskExecutionTimeout = 30 * time.Minute
 
-	// Name of the container inside sandbox pods.
+	// Container name inside the sandbox pod (must match sandbox-template).
 	sandboxContainerName = "claude"
 
 	// Completion markers output by Claude.
@@ -57,16 +62,18 @@ type ClaudeTaskReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// RestConfig is the Kubernetes REST config for exec operations.
+	RestConfig *rest.Config
 	// SandboxClient manages SandboxClaim resources.
 	SandboxClient *sandbox.Client
 	// GitHubClient is used for commenting on issues and getting tokens.
 	GitHubClient *ghclient.Client
-	// ExecClient runs commands in sandbox pods via the K8s exec API.
-	ExecClient *pty.ExecClient
 	// Allowlist provides the list of allowed repositories.
 	Allowlist *AllowlistCache
 	// SandboxTemplateName is the name of the SandboxTemplate to use.
 	SandboxTemplateName string
+	// SandboxNamespace is the namespace where sandbox pods run.
+	SandboxNamespace string
 	// AnthropicAPIKey is the Anthropic API key for Claude.
 	AnthropicAPIKey string
 }
@@ -137,13 +144,9 @@ func (r *ClaudeTaskReconciler) reconcilePending(ctx context.Context, task *claud
 	}
 
 	// Comment on GitHub that work is starting.
-	issueNum := task.Spec.Issue
-	if task.Spec.PullRequest > 0 {
-		issueNum = task.Spec.PullRequest
-	}
 	startComment := fmt.Sprintf("Claude is starting to work on this. A sandbox has been allocated.\n\nTask: `%s`", task.Name)
-	if err := r.GitHubClient.CommentOnIssue(ctx, owner, repo, issueNum, startComment); err != nil {
-		logger.Error(err, "failed to comment on issue", "owner", owner, "repo", repo, "issue", issueNum)
+	if err := r.commentOnTask(ctx, task, owner, repo, startComment); err != nil {
+		logger.Error(err, "failed to comment on task")
 		// Non-fatal — continue even if commenting fails.
 	}
 
@@ -176,18 +179,12 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 			return r.failTask(ctx, task, fmt.Sprintf("sandbox failed to become ready: %v", err))
 		}
 
-		podIP, err := r.SandboxClient.GetPodIP(ctx, readyResult.PodName)
-		if err != nil {
-			return r.failTask(ctx, task, fmt.Sprintf("failed to get pod IP: %v", err))
-		}
-
 		task.Status.PodName = readyResult.PodName
-		task.Status.PodIP = podIP
 		if err := r.Status().Update(ctx, task); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating task status with pod info: %w", err)
 		}
 
-		logger.Info("sandbox ready", "podName", readyResult.PodName, "podIP", podIP)
+		logger.Info("sandbox ready", "podName", readyResult.PodName)
 	}
 
 	// Get GitHub installation token for git operations.
@@ -196,32 +193,34 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		return r.failTask(ctx, task, fmt.Sprintf("failed to get installation token: %v", err))
 	}
 
-	// Build the command script.
-	prompt := r.buildPrompt(task)
-	script := r.buildCommand(owner, repo, token, task, prompt)
+	// Fetch full thread context from GitHub (non-fatal on error).
+	threadContext := r.fetchThreadContext(ctx, task, owner, repo)
 
-	logger.Info("executing Claude command via exec", "repository", task.Spec.Repository, "podName", task.Status.PodName)
+	// Build the command sequence.
+	prompt := r.buildPrompt(task, threadContext)
+	command := r.buildCommand(owner, repo, token, task, prompt)
 
-	// Execute command and wait for completion marker.
+	logger.Info("executing Claude command via exec", "repository", task.Spec.Repository, "pod", task.Status.PodName)
+
+	// Execute command via kubectl exec and wait for completion.
 	execCtx, execCancel := context.WithTimeout(ctx, taskExecutionTimeout)
 	defer execCancel()
 
-	output, err := r.ExecClient.RunAndWaitForMarker(execCtx, task.Status.PodName, sandboxContainerName, script, markerComplete)
-
-	// Log output for debugging (truncate to last 2000 chars).
-	logger.Info("claude exec output", "output_tail", truncateTail(output, 2000))
-
+	output, err := r.execInPod(execCtx, task.Status.PodName, command)
 	if err != nil {
-		// Check if the task failed explicitly.
 		if strings.Contains(output, markerFailed) {
 			return r.failTask(ctx, task, "Claude reported task failure")
 		}
-		logger.Info("task execution failed", "error", err)
 		return r.failTask(ctx, task, fmt.Sprintf("task execution error: %v", err))
 	}
 
+	// Check for failure marker in output even if exec succeeded.
+	if strings.Contains(output, markerFailed) && !strings.Contains(output, markerComplete) {
+		return r.failTask(ctx, task, "Claude reported task failure")
+	}
+
 	// Parse PR URL from output.
-	prURL := pty.ParsePRURL(output)
+	prURL := parsePRURL(output)
 
 	// Update status to Completed.
 	now := metav1.Now()
@@ -235,16 +234,12 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 	}
 
 	// Comment completion on GitHub.
-	issueNum := task.Spec.Issue
-	if task.Spec.PullRequest > 0 {
-		issueNum = task.Spec.PullRequest
-	}
 	completionComment := "Claude has completed the task."
 	if prURL != "" {
 		completionComment += fmt.Sprintf("\n\nPull Request: %s", prURL)
 	}
-	if err := r.GitHubClient.CommentOnIssue(ctx, owner, repo, issueNum, completionComment); err != nil {
-		logger.Error(err, "failed to comment completion on issue")
+	if err := r.commentOnTask(ctx, task, owner, repo, completionComment); err != nil {
+		logger.Error(err, "failed to comment completion")
 	}
 
 	// Cleanup sandbox.
@@ -254,6 +249,44 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 
 	logger.Info("task completed", "prURL", prURL)
 	return ctrl.Result{}, nil
+}
+
+// execInPod executes a command in the sandbox pod via kubectl exec.
+func (r *ClaudeTaskReconciler) execInPod(ctx context.Context, podName, command string) (string, error) {
+	clientset, err := kubernetes.NewForConfig(r.RestConfig)
+	if err != nil {
+		return "", fmt.Errorf("creating clientset: %w", err)
+	}
+
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(r.SandboxNamespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: sandboxContainerName,
+			Command:   []string{"/bin/bash", "-c", command},
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(r.RestConfig, "POST", req.URL())
+	if err != nil {
+		return "", fmt.Errorf("creating SPDY executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	output := stdout.String()
+	if err != nil {
+		return output, fmt.Errorf("exec failed (stderr: %s): %w", stderr.String(), err)
+	}
+
+	return output, nil
 }
 
 // failTask transitions the task to Failed, comments on GitHub, and cleans up.
@@ -271,13 +304,9 @@ func (r *ClaudeTaskReconciler) failTask(ctx context.Context, task *claudetownv1a
 	// Comment failure on GitHub.
 	parts := strings.SplitN(task.Spec.Repository, "/", 2)
 	if len(parts) == 2 {
-		issueNum := task.Spec.Issue
-		if task.Spec.PullRequest > 0 {
-			issueNum = task.Spec.PullRequest
-		}
 		failComment := fmt.Sprintf("Claude failed to complete the task.\n\nReason: %s", reason)
-		if err := r.GitHubClient.CommentOnIssue(ctx, parts[0], parts[1], issueNum, failComment); err != nil {
-			logger.Error(err, "failed to comment failure on issue")
+		if err := r.commentOnTask(ctx, task, parts[0], parts[1], failComment); err != nil {
+			logger.Error(err, "failed to comment failure")
 		}
 	}
 
@@ -291,74 +320,131 @@ func (r *ClaudeTaskReconciler) failTask(ctx context.Context, task *claudetownv1a
 	return ctrl.Result{}, nil
 }
 
+// commentOnTask posts a comment on the appropriate GitHub thread. If the task
+// has a ReviewCommentID, it replies in the review comment thread. Otherwise, it
+// posts a top-level issue/PR comment.
+func (r *ClaudeTaskReconciler) commentOnTask(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo, body string) error {
+	if task.Spec.ReviewCommentID > 0 && task.Spec.PullRequest > 0 {
+		return r.GitHubClient.ReplyToReviewComment(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID, body)
+	}
+
+	issueNum := task.Spec.Issue
+	if task.Spec.PullRequest > 0 {
+		issueNum = task.Spec.PullRequest
+	}
+	return r.GitHubClient.CommentOnIssue(ctx, owner, repo, issueNum, body)
+}
+
+// fetchThreadContext fetches full GitHub thread context for the task.
+// Errors are non-fatal — an empty string is returned on failure.
+func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo string) string {
+	logger := logf.FromContext(ctx)
+	var parts []string
+
+	switch task.Spec.TaskType {
+	case claudetownv1alpha1.ClaudeTaskTypePRReviewFix:
+		if task.Spec.PullRequest > 0 {
+			prCtx, err := r.GitHubClient.FetchPRContext(ctx, owner, repo, task.Spec.PullRequest)
+			if err != nil {
+				logger.Error(err, "failed to fetch PR context")
+			} else if prCtx != "" {
+				parts = append(parts, prCtx)
+			}
+		}
+		if task.Spec.ReviewCommentID > 0 && task.Spec.PullRequest > 0 {
+			threadCtx, err := r.GitHubClient.FetchReviewCommentThread(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID)
+			if err != nil {
+				logger.Error(err, "failed to fetch review comment thread")
+			} else if threadCtx != "" {
+				parts = append(parts, threadCtx)
+			}
+		}
+	default:
+		if task.Spec.Issue > 0 {
+			issueCtx, err := r.GitHubClient.FetchIssueThread(ctx, owner, repo, task.Spec.Issue)
+			if err != nil {
+				logger.Error(err, "failed to fetch issue thread")
+			} else if issueCtx != "" {
+				parts = append(parts, issueCtx)
+			}
+		}
+	}
+
+	return strings.Join(parts, "\n")
+}
+
 // buildPrompt constructs the prompt for Claude based on the task type.
-func (r *ClaudeTaskReconciler) buildPrompt(task *claudetownv1alpha1.ClaudeTask) string {
+func (r *ClaudeTaskReconciler) buildPrompt(task *claudetownv1alpha1.ClaudeTask, threadContext string) string {
+	var sb strings.Builder
+
+	if threadContext != "" {
+		sb.WriteString("# Context\n\n")
+		sb.WriteString(threadContext)
+		sb.WriteString("\n---\n\n# Task\n\n")
+	}
+
 	if task.Spec.Prompt != "" {
-		return task.Spec.Prompt
+		sb.WriteString(task.Spec.Prompt)
+		return sb.String()
 	}
 
 	switch task.Spec.TaskType {
 	case claudetownv1alpha1.ClaudeTaskTypePRReviewFix:
-		return fmt.Sprintf("Fix the review comments on PR #%d in repository %s. The branch is %s. Follow the fix-pr-review skill instructions.",
+		fmt.Fprintf(&sb, "Fix the review comments on PR #%d in repository %s. The branch is %s.",
 			task.Spec.PullRequest, task.Spec.Repository, task.Spec.Branch)
 	default:
-		return fmt.Sprintf("Solve issue #%d in repository %s. Follow the solve-issue skill instructions.",
+		fmt.Fprintf(&sb, "Solve issue #%d in repository %s.",
 			task.Spec.Issue, task.Spec.Repository)
 	}
-}
-
-// buildCommand constructs the full shell script to set up the environment
-// and run Claude inside the sandbox.
-func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *claudetownv1alpha1.ClaudeTask, prompt string) string {
-	var sb strings.Builder
-
-	// Fail fast on setup errors.
-	sb.WriteString("set -e\n")
-
-	// Set environment variables.
-	sb.WriteString(fmt.Sprintf("export GITHUB_TOKEN='%s'\n", token))
-	sb.WriteString(fmt.Sprintf("export ANTHROPIC_API_KEY='%s'\n", r.AnthropicAPIKey))
-
-	// gh CLI auto-detects GITHUB_TOKEN from the environment.
-
-	// Clone the repository into a clean directory.
-	cloneURL := fmt.Sprintf("https://x-access-token:${GITHUB_TOKEN}@github.com/%s/%s.git", owner, repo)
-	sb.WriteString(fmt.Sprintf("rm -rf /home/node/workspace/repo && git clone %s /home/node/workspace/repo\n", cloneURL))
-	sb.WriteString("cd /home/node/workspace/repo\n")
-
-	// For PR review fixes, checkout the PR branch.
-	if task.Spec.TaskType == claudetownv1alpha1.ClaudeTaskTypePRReviewFix && task.Spec.Branch != "" {
-		sb.WriteString(fmt.Sprintf("git checkout %s\n", task.Spec.Branch))
-	}
-
-	// Disable set -e so we can capture Claude's exit code.
-	sb.WriteString("set +e\n")
-
-	// Run Claude in non-interactive agentic mode. --print is required for
-	// headless (no TTY) execution. --dangerously-skip-permissions auto-approves
-	// all tool use (file edits, bash commands, etc).
-	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
-	sb.WriteString(fmt.Sprintf("claude --print --dangerously-skip-permissions '%s' 2>&1\n",
-		escapedPrompt))
-
-	// Emit completion markers based on exit code.
-	sb.WriteString("CLAUDE_EXIT=$?\n")
-	sb.WriteString("if [ $CLAUDE_EXIT -eq 0 ]; then\n")
-	sb.WriteString(fmt.Sprintf("  echo '%s'\n", markerComplete))
-	sb.WriteString("else\n")
-	sb.WriteString(fmt.Sprintf("  echo '%s'\n", markerFailed))
-	sb.WriteString("  exit $CLAUDE_EXIT\n")
-	sb.WriteString("fi\n")
 
 	return sb.String()
 }
 
-// truncateTail returns the last n bytes of s, or s if shorter.
-func truncateTail(s string, n int) string {
-	if len(s) <= n {
-		return s
+// buildCommand constructs the full shell command to set up the environment
+// and run Claude inside the sandbox.
+func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *claudetownv1alpha1.ClaudeTask, prompt string) string {
+	var sb strings.Builder
+
+	// Set environment variables.
+	// GITHUB_TOKEN is sufficient for gh CLI — no explicit auth login needed.
+	fmt.Fprintf(&sb, "export GITHUB_TOKEN='%s'\n", token)
+	fmt.Fprintf(&sb, "export ANTHROPIC_API_KEY='%s'\n", r.AnthropicAPIKey)
+
+	// Clone the repository.
+	cloneURL := fmt.Sprintf("https://x-access-token:${GITHUB_TOKEN}@github.com/%s/%s.git", owner, repo)
+	fmt.Fprintf(&sb, "git clone %s repo\n", cloneURL)
+	sb.WriteString("cd repo\n")
+
+	// For PR review fixes, checkout the PR branch.
+	if task.Spec.TaskType == claudetownv1alpha1.ClaudeTaskTypePRReviewFix && task.Spec.Branch != "" {
+		fmt.Fprintf(&sb, "git checkout %s\n", task.Spec.Branch)
 	}
-	return "..." + s[len(s)-n:]
+
+	// Run Claude with the prompt. Use --print and --dangerously-skip-permissions
+	// for autonomous execution.
+	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
+	fmt.Fprintf(&sb, "claude --print --dangerously-skip-permissions '%s'\n", escapedPrompt)
+
+	return sb.String()
+}
+
+// parsePRURL extracts a pull request URL from output that contains the
+// ":::PR_URL:::" marker.
+func parsePRURL(output string) string {
+	const marker = ":::PR_URL:::"
+	idx := strings.Index(output, marker)
+	if idx == -1 {
+		return ""
+	}
+
+	rest := output[idx+len(marker):]
+	rest = strings.TrimSpace(rest)
+
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 // SetupWithManager sets up the controller with the Manager.
