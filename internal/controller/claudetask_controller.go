@@ -42,8 +42,8 @@ const (
 	// Default timeout for Claude task execution.
 	taskExecutionTimeout = 30 * time.Minute
 
-	// PTY server port inside the sandbox pod.
-	ptyPort = 7681
+	// Name of the container inside sandbox pods.
+	sandboxContainerName = "claude"
 
 	// Completion markers output by Claude.
 	markerComplete = ":::TASK_COMPLETE:::"
@@ -51,8 +51,8 @@ const (
 )
 
 // ClaudeTaskReconciler reconciles a ClaudeTask object.
-// It orchestrates the full lifecycle: creating sandboxes, connecting via PTY,
-// running Claude, parsing results, and cleaning up.
+// It orchestrates the full lifecycle: creating sandboxes, executing commands
+// via kubectl exec, running Claude, parsing results, and cleaning up.
 type ClaudeTaskReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -61,6 +61,8 @@ type ClaudeTaskReconciler struct {
 	SandboxClient *sandbox.Client
 	// GitHubClient is used for commenting on issues and getting tokens.
 	GitHubClient *ghclient.Client
+	// ExecClient runs commands in sandbox pods via the K8s exec API.
+	ExecClient *pty.ExecClient
 	// Allowlist provides the list of allowed repositories.
 	Allowlist *AllowlistCache
 	// SandboxTemplateName is the name of the SandboxTemplate to use.
@@ -73,6 +75,7 @@ type ClaudeTaskReconciler struct {
 // +kubebuilder:rbac:groups=claude-town.claude-town.io,resources=claudetasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=claude-town.claude-town.io,resources=claudetasks/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 
 func (r *ClaudeTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
@@ -148,8 +151,8 @@ func (r *ClaudeTaskReconciler) reconcilePending(ctx context.Context, task *claud
 	return ctrl.Result{Requeue: true}, nil
 }
 
-// reconcileRunning handles the Running phase: waits for sandbox, connects via
-// PTY, executes Claude, and transitions to Completed or Failed.
+// reconcileRunning handles the Running phase: waits for sandbox, executes
+// Claude via kubectl exec, and transitions to Completed or Failed.
 func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claudetownv1alpha1.ClaudeTask) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
@@ -164,8 +167,8 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 	}
 	owner, repo := parts[0], parts[1]
 
-	// If we don't have a pod IP yet, wait for sandbox to be ready.
-	if task.Status.PodIP == "" {
+	// If we don't have a pod name yet, wait for sandbox to be ready.
+	if task.Status.PodName == "" {
 		logger.Info("waiting for sandbox to become ready", "claimName", claimName)
 
 		readyResult, err := r.SandboxClient.WaitForReady(ctx, claimName, sandboxReadyTimeout)
@@ -187,38 +190,33 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		logger.Info("sandbox ready", "podName", readyResult.PodName, "podIP", podIP)
 	}
 
-	// Connect to the PTY.
-	logger.Info("connecting to PTY", "podIP", task.Status.PodIP, "port", ptyPort)
-	ptyClient := pty.NewClient(task.Status.PodIP, ptyPort)
-	if err := ptyClient.Connect(ctx); err != nil {
-		// Pod may not be ready yet — requeue.
-		logger.Error(err, "failed to connect to PTY, will retry")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	defer ptyClient.Close()
-
 	// Get GitHub installation token for git operations.
 	token, err := r.GitHubClient.GetInstallationToken(ctx)
 	if err != nil {
 		return r.failTask(ctx, task, fmt.Sprintf("failed to get installation token: %v", err))
 	}
 
-	// Build the command sequence.
+	// Build the command script.
 	prompt := r.buildPrompt(task)
-	command := r.buildCommand(owner, repo, token, task, prompt)
+	script := r.buildCommand(owner, repo, token, task, prompt)
 
-	logger.Info("executing Claude command", "repository", task.Spec.Repository)
+	logger.Info("executing Claude command via exec", "repository", task.Spec.Repository, "podName", task.Status.PodName)
 
 	// Execute command and wait for completion marker.
 	execCtx, execCancel := context.WithTimeout(ctx, taskExecutionTimeout)
 	defer execCancel()
 
-	output, err := ptyClient.RunAndWaitForMarker(execCtx, command, markerComplete)
+	output, err := r.ExecClient.RunAndWaitForMarker(execCtx, task.Status.PodName, sandboxContainerName, script, markerComplete)
+
+	// Log output for debugging (truncate to last 2000 chars).
+	logger.Info("claude exec output", "output_tail", truncateTail(output, 2000))
+
 	if err != nil {
 		// Check if the task failed explicitly.
 		if strings.Contains(output, markerFailed) {
 			return r.failTask(ctx, task, "Claude reported task failure")
 		}
+		logger.Info("task execution failed", "error", err)
 		return r.failTask(ctx, task, fmt.Sprintf("task execution error: %v", err))
 	}
 
@@ -301,43 +299,66 @@ func (r *ClaudeTaskReconciler) buildPrompt(task *claudetownv1alpha1.ClaudeTask) 
 
 	switch task.Spec.TaskType {
 	case claudetownv1alpha1.ClaudeTaskTypePRReviewFix:
-		return fmt.Sprintf("/skill fix-pr-review\n\nFix the review comments on PR #%d in repository %s. The branch is %s.",
+		return fmt.Sprintf("Fix the review comments on PR #%d in repository %s. The branch is %s. Follow the fix-pr-review skill instructions.",
 			task.Spec.PullRequest, task.Spec.Repository, task.Spec.Branch)
 	default:
-		return fmt.Sprintf("/skill solve-issue\n\nSolve issue #%d in repository %s.",
+		return fmt.Sprintf("Solve issue #%d in repository %s. Follow the solve-issue skill instructions.",
 			task.Spec.Issue, task.Spec.Repository)
 	}
 }
 
-// buildCommand constructs the full shell command to set up the environment
+// buildCommand constructs the full shell script to set up the environment
 // and run Claude inside the sandbox.
 func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *claudetownv1alpha1.ClaudeTask, prompt string) string {
 	var sb strings.Builder
+
+	// Fail fast on setup errors.
+	sb.WriteString("set -e\n")
 
 	// Set environment variables.
 	sb.WriteString(fmt.Sprintf("export GITHUB_TOKEN='%s'\n", token))
 	sb.WriteString(fmt.Sprintf("export ANTHROPIC_API_KEY='%s'\n", r.AnthropicAPIKey))
 
-	// Authenticate gh CLI.
-	sb.WriteString("echo \"$GITHUB_TOKEN\" | gh auth login --with-token\n")
+	// gh CLI auto-detects GITHUB_TOKEN from the environment.
 
-	// Clone the repository.
+	// Clone the repository into a clean directory.
 	cloneURL := fmt.Sprintf("https://x-access-token:${GITHUB_TOKEN}@github.com/%s/%s.git", owner, repo)
-	sb.WriteString(fmt.Sprintf("git clone %s repo\n", cloneURL))
-	sb.WriteString("cd repo\n")
+	sb.WriteString(fmt.Sprintf("rm -rf /home/node/workspace/repo && git clone %s /home/node/workspace/repo\n", cloneURL))
+	sb.WriteString("cd /home/node/workspace/repo\n")
 
 	// For PR review fixes, checkout the PR branch.
 	if task.Spec.TaskType == claudetownv1alpha1.ClaudeTaskTypePRReviewFix && task.Spec.Branch != "" {
 		sb.WriteString(fmt.Sprintf("git checkout %s\n", task.Spec.Branch))
 	}
 
-	// Run Claude with the prompt. Use --print and --dangerously-skip-permissions
-	// for autonomous execution.
+	// Disable set -e so we can capture Claude's exit code.
+	sb.WriteString("set +e\n")
+
+	// Run Claude in non-interactive agentic mode. --print is required for
+	// headless (no TTY) execution. --dangerously-skip-permissions auto-approves
+	// all tool use (file edits, bash commands, etc).
 	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
-	sb.WriteString(fmt.Sprintf("claude --print --dangerously-skip-permissions --max-turns %d '%s'\n",
-		task.Spec.MaxIterations, escapedPrompt))
+	sb.WriteString(fmt.Sprintf("claude --print --dangerously-skip-permissions '%s' 2>&1\n",
+		escapedPrompt))
+
+	// Emit completion markers based on exit code.
+	sb.WriteString("CLAUDE_EXIT=$?\n")
+	sb.WriteString("if [ $CLAUDE_EXIT -eq 0 ]; then\n")
+	sb.WriteString(fmt.Sprintf("  echo '%s'\n", markerComplete))
+	sb.WriteString("else\n")
+	sb.WriteString(fmt.Sprintf("  echo '%s'\n", markerFailed))
+	sb.WriteString("  exit $CLAUDE_EXIT\n")
+	sb.WriteString("fi\n")
 
 	return sb.String()
+}
+
+// truncateTail returns the last n bytes of s, or s if shorter.
+func truncateTail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 // SetupWithManager sets up the controller with the Manager.

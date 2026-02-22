@@ -1,6 +1,8 @@
+{{- if ne .Values.sandbox.namespace .Release.Namespace }}
 apiVersion: v1
 kind: Namespace
 metadata:
   name: {{ .Values.sandbox.namespace }}
   labels:
     {{- include "claude-town.labels" . | nindent 4 }}
+{{- end }}

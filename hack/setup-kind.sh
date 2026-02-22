@@ -48,10 +48,18 @@ helm upgrade --install claude-town "${ROOT_DIR}/chart" \
     --set selfDNS="${SELF_DNS:-localhost}"
 
 echo ""
+echo "=== Starting port-forward (background) ==="
+# Kill any existing port-forward for this port
+pkill -f "port-forward.*claude-town.*8082" 2>/dev/null || true
+sleep 1
+kubectl port-forward -n claude-town-system svc/claude-town-webhook 8082:8082 &
+PF_PID=$!
+echo "  Port-forward PID: ${PF_PID} (localhost:8082 -> svc/claude-town-webhook:8082)"
+
+echo ""
 echo "=== Setup complete! ==="
 echo ""
-echo "To expose webhooks for local testing with cloudflared:"
-echo "  cloudflared tunnel --url http://localhost:30082"
+echo "To tunnel webhooks from GitHub:"
+echo "  cloudflared tunnel --url http://localhost:8082"
 echo ""
-echo "Then update the selfDNS and upgrade the chart:"
-echo "  helm upgrade claude-town chart/ -n claude-town-system --set selfDNS=<tunnel-url>"
+echo "To stop port-forward: kill ${PF_PID}"

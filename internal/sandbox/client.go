@@ -113,7 +113,7 @@ func (c *Client) WaitForReady(ctx context.Context, claimName string, timeout tim
 		return nil, fmt.Errorf("failed to get SandboxClaim %q: %w", claimName, err)
 	}
 
-	sandboxName, found, err := unstructured.NestedString(claim.Object, "status", "sandboxName")
+	sandboxName, found, err := unstructured.NestedString(claim.Object, "status", "sandbox", "Name")
 	if err != nil || !found || sandboxName == "" {
 		// Watch the claim until sandboxName is populated.
 		sandboxName, err = c.waitForSandboxName(ctx, claimName)
@@ -122,7 +122,17 @@ func (c *Client) WaitForReady(ctx context.Context, claimName string, timeout tim
 		}
 	}
 
-	// Now watch the Sandbox resource until it becomes ready.
+	// Check if the Sandbox is already ready before watching.
+	existing, err := c.dynClient.Resource(SandboxGVR).Namespace(c.namespace).Get(ctx, sandboxName, metav1.GetOptions{})
+	if err == nil && isSandboxReady(existing) {
+		podName := existing.GetAnnotations()[PodNameAnnotation]
+		return &ReadyResult{
+			SandboxName: sandboxName,
+			PodName:     podName,
+		}, nil
+	}
+
+	// Watch the Sandbox resource until it becomes ready.
 	watcher, err := c.dynClient.Resource(SandboxGVR).Namespace(c.namespace).Watch(ctx, metav1.ListOptions{
 		FieldSelector: "metadata.name=" + sandboxName,
 	})
@@ -161,6 +171,14 @@ func (c *Client) WaitForReady(ctx context.Context, claimName string, timeout tim
 
 // waitForSandboxName watches the SandboxClaim until status.sandboxName is populated.
 func (c *Client) waitForSandboxName(ctx context.Context, claimName string) (string, error) {
+	// Re-check current state before watching.
+	claim, getErr := c.dynClient.Resource(SandboxClaimGVR).Namespace(c.namespace).Get(ctx, claimName, metav1.GetOptions{})
+	if getErr == nil {
+		if name, found, err := unstructured.NestedString(claim.Object, "status", "sandbox", "Name"); err == nil && found && name != "" {
+			return name, nil
+		}
+	}
+
 	watcher, err := c.dynClient.Resource(SandboxClaimGVR).Namespace(c.namespace).Watch(ctx, metav1.ListOptions{
 		FieldSelector: "metadata.name=" + claimName,
 	})
@@ -186,7 +204,7 @@ func (c *Client) waitForSandboxName(ctx context.Context, claimName string) (stri
 				continue
 			}
 
-			sandboxName, found, err := unstructured.NestedString(obj.Object, "status", "sandboxName")
+			sandboxName, found, err := unstructured.NestedString(obj.Object, "status", "sandbox", "Name")
 			if err == nil && found && sandboxName != "" {
 				return sandboxName, nil
 			}

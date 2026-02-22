@@ -32,10 +32,13 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "list", "watch"]
-  # Pods (for getting pod IP)
+  # Pods (for getting pod IP and exec)
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   # Leader election
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

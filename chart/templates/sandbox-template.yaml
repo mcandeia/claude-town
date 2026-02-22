@@ -1,4 +1,4 @@
-apiVersion: agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
 kind: SandboxTemplate
 metadata:
   name: {{ .Values.sandbox.templateName }}
@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "claude-town.labels" . | nindent 4 }}
 spec:
-  template:
+  podTemplate:
     spec:
       containers:
         - name: claude

@@ -22,6 +22,9 @@ spec:
     - jsonPath: .spec.repo
       name: Repo
       type: string
+    - jsonPath: .spec.repositoryPattern
+      name: Pattern
+      type: string
     - jsonPath: .spec.maxConcurrentTasks
       name: Max Tasks
       type: integer
@@ -51,7 +54,9 @@ spec:
           metadata:
             type: object
           spec:
-            description: ClaudeRepositorySpec defines the desired state of ClaudeRepository.
+            description: |-
+              ClaudeRepositorySpec defines the desired state of ClaudeRepository.
+              Use Owner+Repo for exact match, or RepositoryPattern for regex matching.
             properties:
               labels:
                 description: |-
@@ -67,14 +72,17 @@ spec:
                 minimum: 1
                 type: integer
               owner:
-                description: Owner is the GitHub organization or user
+                description: Owner is the GitHub organization or user (exact match).
                 type: string
               repo:
-                description: Repo is the repository name
+                description: Repo is the repository name (exact match).
                 type: string
-            required:
-            - owner
-            - repo
+              repositoryPattern:
+                description: |-
+                  RepositoryPattern is a regex pattern matched against "owner/repo".
+                  When set, Owner and Repo fields are ignored for matching purposes.
+                  Examples: "my-org/.*", "my-org/frontend-.*", ".*/my-repo"
+                type: string
             type: object
           status:
             description: ClaudeRepositoryStatus defines the observed state of ClaudeRepository.

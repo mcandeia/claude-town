@@ -21,14 +21,21 @@ import (
 )
 
 // ClaudeRepositorySpec defines the desired state of ClaudeRepository.
+// Use Owner+Repo for exact match, or RepositoryPattern for regex matching.
 type ClaudeRepositorySpec struct {
-	// Owner is the GitHub organization or user
-	// +kubebuilder:validation:Required
-	Owner string `json:"owner"`
+	// Owner is the GitHub organization or user (exact match).
+	// +optional
+	Owner string `json:"owner,omitempty"`
 
-	// Repo is the repository name
-	// +kubebuilder:validation:Required
-	Repo string `json:"repo"`
+	// Repo is the repository name (exact match).
+	// +optional
+	Repo string `json:"repo,omitempty"`
+
+	// RepositoryPattern is a regex pattern matched against "owner/repo".
+	// When set, Owner and Repo fields are ignored for matching purposes.
+	// Examples: "my-org/.*", "my-org/frontend-.*", ".*/my-repo"
+	// +optional
+	RepositoryPattern string `json:"repositoryPattern,omitempty"`
 
 	// Labels restricts the bot to only respond on issues with these labels.
 	// Empty means all issues are allowed.
@@ -55,6 +62,7 @@ type ClaudeRepositoryStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Owner",type=string,JSONPath=`.spec.owner`
 // +kubebuilder:printcolumn:name="Repo",type=string,JSONPath=`.spec.repo`
+// +kubebuilder:printcolumn:name="Pattern",type=string,JSONPath=`.spec.repositoryPattern`
 // +kubebuilder:printcolumn:name="Max Tasks",type=integer,JSONPath=`.spec.maxConcurrentTasks`
 // +kubebuilder:printcolumn:name="Active",type=integer,JSONPath=`.status.activeTasks`
 
@@ -67,8 +75,17 @@ type ClaudeRepository struct {
 	Status ClaudeRepositoryStatus `json:"status,omitempty"`
 }
 
-// FullName returns "owner/repo"
+// IsPattern returns true if this entry uses a regex pattern instead of exact match.
+func (r *ClaudeRepository) IsPattern() bool {
+	return r.Spec.RepositoryPattern != ""
+}
+
+// FullName returns "owner/repo" for exact-match entries.
+// For pattern entries it returns the pattern itself.
 func (r *ClaudeRepository) FullName() string {
+	if r.IsPattern() {
+		return r.Spec.RepositoryPattern
+	}
 	return r.Spec.Owner + "/" + r.Spec.Repo
 }
 

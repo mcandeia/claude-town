@@ -47,6 +47,7 @@ import (
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
 	"github.com/marcoscandeia/claude-town/internal/controller"
 	ghclient "github.com/marcoscandeia/claude-town/internal/github"
+	"github.com/marcoscandeia/claude-town/internal/pty"
 	"github.com/marcoscandeia/claude-town/internal/sandbox"
 	webhookhandler "github.com/marcoscandeia/claude-town/internal/webhook"
 	// +kubebuilder:scaffold:imports
@@ -243,6 +244,7 @@ func main() {
 
 	// --- Create GitHub client ---
 	var githubClient *ghclient.Client
+	setupLog.Info("GitHub config check", "appID", ghAppID, "installID", ghInstallID, "privateKeyLen", len(ghPrivateKey), "webhookSecret", ghWebhookSecret != "", "selfDNS", selfDNS)
 	if ghAppID > 0 && ghInstallID > 0 && ghPrivateKey != "" {
 		githubClient, err = ghclient.NewClient(ghclient.Config{
 			AppID:          ghAppID,
@@ -279,12 +281,20 @@ func main() {
 	// --- Create shared allowlist cache ---
 	allowlist := controller.NewAllowlistCache()
 
+	// --- Create exec client for running commands in sandbox pods ---
+	execClient, err := pty.NewExecClient(mgr.GetConfig(), sandboxNamespace)
+	if err != nil {
+		setupLog.Error(err, "unable to create exec client")
+		os.Exit(1)
+	}
+
 	// --- Register controllers ---
 	if err := (&controller.ClaudeTaskReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		SandboxClient:       sandboxClient,
 		GitHubClient:        githubClient,
+		ExecClient:          execClient,
 		Allowlist:           allowlist,
 		SandboxTemplateName: sandboxTemplateName,
 		AnthropicAPIKey:     anthropicKey,
