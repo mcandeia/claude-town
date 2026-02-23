@@ -25,6 +25,9 @@ anthropic:
 selfDNS: ""
 
 sandbox:
+  # Install agent-sandbox controllers and CRDs (v0.1.1).
+  # Set to false if agent-sandbox is already installed on the cluster.
+  install: true
   namespace: claude-town-system
   templateName: claude-sandbox
 

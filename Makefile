@@ -99,10 +99,10 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 
 .PHONY: sync-crds
 sync-crds: ## Sync generated CRDs into the Helm chart
-	@mkdir -p chart/templates/crds
-	@rm -f chart/templates/crds/*.yaml
-	@cp config/crd/bases/*.yaml chart/templates/crds/
-	@echo "CRDs synced to chart/templates/crds/"
+	@mkdir -p chart/crds
+	@rm -f chart/crds/claude-town.*.yaml
+	@cp config/crd/bases/*.yaml chart/crds/
+	@echo "CRDs synced to chart/crds/"
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
