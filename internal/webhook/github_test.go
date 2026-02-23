@@ -25,6 +25,8 @@ import (
 	"testing"
 )
 
+const testSecret = "test-secret"
+
 // mockCreator is a test double for TaskCreator.
 type mockCreator struct {
 	allowed      bool
@@ -137,7 +139,7 @@ func TestWebhookHandler_InvalidSignature(t *testing.T) {
 
 func TestWebhookHandler_ValidSignature_IssueComment(t *testing.T) {
 	creator := &mockCreator{allowed: true}
-	secret := "test-secret"
+	secret := testSecret
 	handler := NewHandler(secret, "claude-town", creator)
 
 	payload := map[string]interface{}{
@@ -393,7 +395,7 @@ func TestValidateSignature(t *testing.T) {
 
 func TestWebhookHandler_IssuesOpened_Ignored(t *testing.T) {
 	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
-	secret := "test-secret"
+	secret := testSecret
 	handler := NewHandler(secret, "claude-town", creator)
 
 	payload := map[string]any{
@@ -435,7 +437,7 @@ func TestWebhookHandler_IssuesOpened_Ignored(t *testing.T) {
 
 func TestWebhookHandler_IssuesLabeled_WithMatchingLabel(t *testing.T) {
 	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
-	secret := "test-secret"
+	secret := testSecret
 	handler := NewHandler(secret, "claude-town", creator)
 
 	payload := map[string]any{
@@ -486,7 +488,7 @@ func TestWebhookHandler_IssuesLabeled_WithMatchingLabel(t *testing.T) {
 
 func TestWebhookHandler_IssuesLabeled_NoAutoLabels(t *testing.T) {
 	creator := &mockCreator{allowed: true, autoLabels: nil}
-	secret := "test-secret"
+	secret := testSecret
 	handler := NewHandler(secret, "claude-town", creator)
 
 	payload := map[string]any{
@@ -530,7 +532,7 @@ func TestWebhookHandler_IssuesLabeled_NoAutoLabels(t *testing.T) {
 
 func TestWebhookHandler_IssuesLabeled_NoMatchingLabel(t *testing.T) {
 	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
-	secret := "test-secret"
+	secret := testSecret
 	handler := NewHandler(secret, "claude-town", creator)
 
 	payload := map[string]any{

@@ -642,7 +642,7 @@ func accumulateCost(existing *claudetownv1alpha1.CostReport, cr claudeResult) *c
 	// Recalculate total cost: parse existing cost and add new.
 	var totalCost float64
 	if existing.EstimatedCost != "" {
-		fmt.Sscanf(existing.EstimatedCost, "$%f", &totalCost)
+		_, _ = fmt.Sscanf(existing.EstimatedCost, "$%f", &totalCost)
 	}
 	totalCost += cr.TotalCostUSD
 	existing.EstimatedCost = fmt.Sprintf("$%.4f", totalCost)
