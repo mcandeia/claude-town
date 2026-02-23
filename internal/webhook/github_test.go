@@ -35,6 +35,7 @@ type mockCreator struct {
 	resumeCalled bool
 	resumeResult bool
 	resumeErr    error
+	autoLabels   []string
 }
 
 func (m *mockCreator) CreateTask(_ context.Context, req TaskRequest) error {
@@ -47,10 +48,18 @@ func (m *mockCreator) IsRepoAllowed(_ context.Context, _, _ string) (bool, error
 	return m.allowed, m.allowedErr
 }
 
+func (m *mockCreator) IsUserAllowed(_ context.Context, _, _, _ string) (bool, error) {
+	return true, nil
+}
+
 func (m *mockCreator) ResumeClarification(_ context.Context, req TaskRequest) (bool, error) {
 	m.resumeCalled = true
 	m.lastRequest = req
 	return m.resumeResult, m.resumeErr
+}
+
+func (m *mockCreator) GetAutoLabels(_ context.Context, _, _ string) []string {
+	return m.autoLabels
 }
 
 func TestParseMention(t *testing.T) {
@@ -379,5 +388,187 @@ func TestValidateSignature(t *testing.T) {
 				t.Errorf("validateSignature() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWebhookHandler_IssuesOpened_Ignored(t *testing.T) {
+	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
+	secret := "test-secret"
+	handler := NewHandler(secret, "claude-town", creator)
+
+	payload := map[string]any{
+		"action": "opened",
+		"issue": map[string]any{
+			"number": 10,
+			"labels": []map[string]any{
+				{"name": "claude"},
+			},
+		},
+		"sender": map[string]any{
+			"login": "testuser",
+		},
+		"repository": map[string]any{
+			"owner": map[string]any{
+				"login": "myorg",
+			},
+			"name": "myrepo",
+		},
+	}
+	body, _ := json.Marshal(payload)
+	sig := computeSignature(body, secret)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// "opened" action is ignored; only "labeled" is handled.
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if creator.createCalled {
+		t.Error("expected CreateTask NOT to be called")
+	}
+}
+
+func TestWebhookHandler_IssuesLabeled_WithMatchingLabel(t *testing.T) {
+	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
+	secret := "test-secret"
+	handler := NewHandler(secret, "claude-town", creator)
+
+	payload := map[string]any{
+		"action": "labeled",
+		"issue": map[string]any{
+			"number": 11,
+			"labels": []map[string]any{
+				{"name": "bug"},
+				{"name": "claude"},
+			},
+		},
+		"label": map[string]any{
+			"name": "claude",
+		},
+		"sender": map[string]any{
+			"login": "testuser",
+		},
+		"repository": map[string]any{
+			"owner": map[string]any{
+				"login": "myorg",
+			},
+			"name": "myrepo",
+		},
+	}
+	body, _ := json.Marshal(payload)
+	sig := computeSignature(body, secret)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected status %d, got %d", http.StatusCreated, rr.Code)
+	}
+	if !creator.createCalled {
+		t.Fatal("expected CreateTask to be called")
+	}
+	if creator.lastRequest.TaskType != "IssueSolve" {
+		t.Errorf("expected task type %q, got %q", "IssueSolve", creator.lastRequest.TaskType)
+	}
+	if creator.lastRequest.Issue != 11 {
+		t.Errorf("expected issue %d, got %d", 11, creator.lastRequest.Issue)
+	}
+}
+
+func TestWebhookHandler_IssuesLabeled_NoAutoLabels(t *testing.T) {
+	creator := &mockCreator{allowed: true, autoLabels: nil}
+	secret := "test-secret"
+	handler := NewHandler(secret, "claude-town", creator)
+
+	payload := map[string]any{
+		"action": "labeled",
+		"issue": map[string]any{
+			"number": 12,
+			"labels": []map[string]any{
+				{"name": "claude"},
+			},
+		},
+		"label": map[string]any{
+			"name": "claude",
+		},
+		"sender": map[string]any{
+			"login": "testuser",
+		},
+		"repository": map[string]any{
+			"owner": map[string]any{
+				"login": "myorg",
+			},
+			"name": "myrepo",
+		},
+	}
+	body, _ := json.Marshal(payload)
+	sig := computeSignature(body, secret)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if creator.createCalled {
+		t.Error("expected CreateTask NOT to be called")
+	}
+}
+
+func TestWebhookHandler_IssuesLabeled_NoMatchingLabel(t *testing.T) {
+	creator := &mockCreator{allowed: true, autoLabels: []string{"claude"}}
+	secret := "test-secret"
+	handler := NewHandler(secret, "claude-town", creator)
+
+	payload := map[string]any{
+		"action": "labeled",
+		"issue": map[string]any{
+			"number": 13,
+			"labels": []map[string]any{
+				{"name": "bug"},
+				{"name": "enhancement"},
+			},
+		},
+		"label": map[string]any{
+			"name": "bug",
+		},
+		"sender": map[string]any{
+			"login": "testuser",
+		},
+		"repository": map[string]any{
+			"owner": map[string]any{
+				"login": "myorg",
+			},
+			"name": "myrepo",
+		},
+	}
+	body, _ := json.Marshal(payload)
+	sig := computeSignature(body, secret)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	if creator.createCalled {
+		t.Error("expected CreateTask NOT to be called")
 	}
 }

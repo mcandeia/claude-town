@@ -32,3 +32,5 @@ hack/local-*.sh
 
 # Worktrees
 .worktrees/
+
+docs/

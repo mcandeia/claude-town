@@ -16,12 +16,36 @@ Kubernetes operator that spawns Claude Code agents to solve GitHub issues and fi
 - Kubernetes cluster (or KIND for local development)
 - [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) installed
 - Helm 3
-- A GitHub App
+- A GitHub App **or** a Personal Access Token (PAT)
 - An Anthropic API key
 
 ## Setup
 
-### 1. Create a GitHub App
+There are two authentication methods: **GitHub App** (full-featured) or **PAT** (simpler setup).
+
+### Option A: Personal Access Token (simplest)
+
+Create a [fine-grained PAT](https://github.com/settings/tokens?type=beta) with these permissions on your target repos:
+
+- Issues: Read & Write
+- Pull Requests: Read & Write
+- Contents: Read & Write
+- Webhooks: Read & Write (for auto-creating repo webhooks)
+
+```bash
+helm install claude-town chart/ \
+  --namespace claude-town-system \
+  --create-namespace \
+  --set github.pat="ghp_xxxxxxxxxxxx" \
+  --set github.webhookSecret="YOUR_SECRET" \
+  --set github.botName="your-bot-name" \
+  --set anthropic.apiKey="YOUR_ANTHROPIC_KEY" \
+  --set selfDNS="your-domain.com"
+```
+
+When you create a `ClaudeRepository`, the operator automatically creates a webhook on the repo.
+
+### Option B: GitHub App
 
 Create a new GitHub App at https://github.com/settings/apps/new with:
 
@@ -32,13 +56,12 @@ Create a new GitHub App at https://github.com/settings/apps/new with:
 - Metadata: Read
 
 **Subscribe to events:**
+- Issues
 - Issue comment
 - Pull request review
 - Pull request review comment
 
 Save the App ID, generate a private key, and note the Installation ID after installing the app on your org/repos.
-
-### 2. Install
 
 ```bash
 helm install claude-town chart/ \
@@ -52,7 +75,7 @@ helm install claude-town chart/ \
   --set selfDNS="your-domain.com"
 ```
 
-### 3. Allow repositories
+### Allow repositories
 
 Create a `ClaudeRepository` resource for each repo you want the bot to work on:
 
@@ -68,7 +91,54 @@ spec:
   maxConcurrentTasks: 3
 ```
 
-### 4. Use it
+Webhooks are auto-created when a `ClaudeRepository` is added (using the PAT or App credentials). The webhook ID is stored in the resource status and cleaned up on deletion.
+
+#### Per-repo PAT
+
+You can use a different PAT for specific repos by referencing a Kubernetes Secret:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: external-org-pat
+  namespace: claude-town-system
+type: Opaque
+stringData:
+  token: "ghp_yyyyyyyyyyyy"
+---
+apiVersion: claude-town.claude-town.io/v1alpha1
+kind: ClaudeRepository
+metadata:
+  name: external-repo
+  namespace: claude-town-system
+spec:
+  owner: external-org
+  repo: their-app
+  patSecretRef:
+    name: external-org-pat
+```
+
+### Auto-trigger by label
+
+You can configure labels on a `ClaudeRepository` so that issues are automatically picked up without needing an @mention:
+
+```yaml
+apiVersion: claude-town.claude-town.io/v1alpha1
+kind: ClaudeRepository
+metadata:
+  name: my-repo
+spec:
+  owner: my-org
+  repo: my-app
+  labels: ["claude"]
+```
+
+When an issue is **created with** or **has added** a matching label (e.g. `claude`), the operator automatically creates a task. The user allowlist is still enforced — the user who created the issue or added the label must be allowed.
+
+**Note:** If you add labels to an existing `ClaudeRepository`, you must delete and recreate it so the webhook is re-created with the `issues` event subscription.
+
+### Use it
 
 Comment on any issue in an allowed repository:
 
@@ -112,6 +182,34 @@ status:
     estimatedCost: "$0.1400"
     durationMs: 45200
 ```
+
+## Handler Allowlist
+
+By default, anyone who can comment on an allowed repository can trigger Claude. You can restrict this with username and/or role-based allowlists.
+
+### Global allowlist (Helm values)
+
+```yaml
+github:
+  allowedUsers: ["alice", "bob"]      # GitHub usernames
+  allowedRoles: ["admin", "maintain"] # Repo permission levels
+```
+
+### Per-repo allowlist (ClaudeRepository)
+
+```yaml
+apiVersion: claude-town.claude-town.io/v1alpha1
+kind: ClaudeRepository
+metadata:
+  name: my-repo
+spec:
+  owner: my-org
+  repo: my-app
+  allowedUsers: ["alice"]
+  allowedRoles: ["admin"]
+```
+
+Global and per-repo lists are merged (union). If both lists are empty at all levels, anyone can trigger Claude (backwards compatible). Valid roles: `admin`, `maintain`, `write`.
 
 ## Local Development
 

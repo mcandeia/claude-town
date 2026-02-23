@@ -57,6 +57,21 @@ spec:
               ClaudeRepositorySpec defines the desired state of ClaudeRepository.
               Use Owner+Repo for exact match, or RepositoryPattern for regex matching.
             properties:
+              allowedRoles:
+                description: |-
+                  AllowedRoles is a list of repo permission levels that can trigger Claude.
+                  Valid values: "admin", "maintain", "write".
+                  Merged with global allowedRoles. Empty = no role-based restriction.
+                items:
+                  type: string
+                type: array
+              allowedUsers:
+                description: |-
+                  AllowedUsers is a list of GitHub usernames allowed to trigger Claude.
+                  Merged with global allowedUsers. Empty = no user-based restriction.
+                items:
+                  type: string
+                type: array
               labels:
                 description: |-
                   Labels restricts the bot to only respond on issues with these labels.
@@ -73,6 +88,22 @@ spec:
               owner:
                 description: Owner is the GitHub organization or user (exact match).
                 type: string
+              patSecretRef:
+                description: |-
+                  PATSecretRef references a K8s Secret containing a GitHub PAT.
+                  The Secret must have a key "token" with the PAT value.
+                  When set, this PAT is used instead of the global GitHub App/PAT.
+                properties:
+                  key:
+                    default: token
+                    description: Key is the key within the Secret. Defaults to "token".
+                    type: string
+                  name:
+                    description: Name is the name of the Secret.
+                    type: string
+                required:
+                - name
+                type: object
               repo:
                 description: Repo is the repository name (exact match).
                 type: string
@@ -147,6 +178,10 @@ spec:
                   - type
                   type: object
                 type: array
+              webhookID:
+                description: WebhookID is the GitHub webhook ID created for this repository.
+                format: int64
+                type: integer
             type: object
         type: object
     served: true

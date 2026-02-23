@@ -20,6 +20,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// SecretRef references a key in a Kubernetes Secret.
+type SecretRef struct {
+	// Name is the name of the Secret.
+	Name string `json:"name"`
+	// Key is the key within the Secret. Defaults to "token".
+	// +kubebuilder:default=token
+	Key string `json:"key,omitempty"`
+}
+
 // ClaudeRepositorySpec defines the desired state of ClaudeRepository.
 // Use Owner+Repo for exact match, or RepositoryPattern for regex matching.
 type ClaudeRepositorySpec struct {
@@ -46,12 +55,33 @@ type ClaudeRepositorySpec struct {
 	// +kubebuilder:default=3
 	// +kubebuilder:validation:Minimum=1
 	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
+
+	// PATSecretRef references a K8s Secret containing a GitHub PAT.
+	// The Secret must have a key "token" with the PAT value.
+	// When set, this PAT is used instead of the global GitHub App/PAT.
+	// +optional
+	PATSecretRef *SecretRef `json:"patSecretRef,omitempty"`
+
+	// AllowedUsers is a list of GitHub usernames allowed to trigger Claude.
+	// Merged with global allowedUsers. Empty = no user-based restriction.
+	// +optional
+	AllowedUsers []string `json:"allowedUsers,omitempty"`
+
+	// AllowedRoles is a list of repo permission levels that can trigger Claude.
+	// Valid values: "admin", "maintain", "write".
+	// Merged with global allowedRoles. Empty = no role-based restriction.
+	// +optional
+	AllowedRoles []string `json:"allowedRoles,omitempty"`
 }
 
 // ClaudeRepositoryStatus defines the observed state of ClaudeRepository.
 type ClaudeRepositoryStatus struct {
 	// ActiveTasks is the current number of running tasks for this repo
 	ActiveTasks int `json:"activeTasks,omitempty"`
+
+	// WebhookID is the GitHub webhook ID created for this repository.
+	// +optional
+	WebhookID int64 `json:"webhookID,omitempty"`
 
 	// Conditions represent the latest available observations
 	// +optional

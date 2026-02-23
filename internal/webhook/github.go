@@ -36,9 +36,15 @@ type TaskCreator interface {
 	CreateTask(ctx context.Context, req TaskRequest) error
 	// IsRepoAllowed checks whether the given owner/repo has a ClaudeRepository resource.
 	IsRepoAllowed(ctx context.Context, owner, repo string) (bool, error)
+	// IsUserAllowed checks whether the given user is allowed to trigger Claude
+	// on the given repo (via username or role allowlist).
+	IsUserAllowed(ctx context.Context, owner, repo, username string) (bool, error)
 	// ResumeClarification checks if a WaitingForClarification task exists for the
 	// given repo+issue and, if so, fills in the answer and resumes it.
 	ResumeClarification(ctx context.Context, req TaskRequest) (bool, error)
+	// GetAutoLabels returns the auto-trigger labels for the given repo.
+	// Returns nil if no labels configured (auto-trigger disabled).
+	GetAutoLabels(ctx context.Context, owner, repo string) []string
 }
 
 // TaskRequest holds the information extracted from a GitHub webhook event
@@ -109,6 +115,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger.Info("received webhook", "event", event)
 
 	switch event {
+	case "issues":
+		h.handleIssuesEvent(r.Context(), w, body)
 	case "issue_comment":
 		h.handleIssueComment(r.Context(), w, body)
 	case "pull_request_review":
@@ -187,6 +195,18 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	allowed, err = h.creator.IsUserAllowed(ctx, owner, repo, event.Comment.User.Login)
+	if err != nil {
+		logger.Error(err, "failed to check user allowlist", "user", event.Comment.User.Login)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		logger.Info("user not allowed", "user", event.Comment.User.Login, "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	// Try to resume a task waiting for clarification.
 	issueNum := event.Issue.Number
 	resumed, err := h.creator.ResumeClarification(ctx, TaskRequest{
@@ -205,6 +225,113 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		Owner:    owner,
 		Repo:     repo,
 		Issue:    issueNum,
+		TaskType: "IssueSolve",
+	}
+
+	if err := h.creator.CreateTask(ctx, req); err != nil {
+		logger.Error(err, "failed to create task", "owner", owner, "repo", repo, "issue", req.Issue)
+		http.Error(w, "failed to create task", http.StatusInternalServerError)
+		return
+	}
+
+	logger.Info("created IssueSolve task", "owner", owner, "repo", repo, "issue", req.Issue)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// issuesEvent represents the relevant fields of a GitHub issues event.
+type issuesEvent struct {
+	Action string `json:"action"`
+	Issue  struct {
+		Number int `json:"number"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	} `json:"issue"`
+	Label *struct {
+		Name string `json:"name"`
+	} `json:"label"` // only set for "labeled" action
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Repository struct {
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+		Name string `json:"name"`
+	} `json:"repository"`
+}
+
+// handleIssuesEvent handles an issues webhook event for auto-triggering by label.
+func (h *Handler) handleIssuesEvent(ctx context.Context, w http.ResponseWriter, body []byte) {
+	logger := log.FromContext(ctx)
+
+	var event issuesEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		logger.Error(err, "failed to parse issues event")
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if event.Action != "labeled" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	owner := event.Repository.Owner.Login
+	repo := event.Repository.Name
+
+	allowed, err := h.creator.IsRepoAllowed(ctx, owner, repo)
+	if err != nil {
+		logger.Error(err, "failed to check repo allowlist", "owner", owner, "repo", repo)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		logger.Info("repo not allowed", "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	autoLabels := h.creator.GetAutoLabels(ctx, owner, repo)
+	if len(autoLabels) == 0 {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Check if the newly added label matches any auto-label.
+	if event.Label == nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	var matched bool
+	for _, al := range autoLabels {
+		if al == event.Label.Name {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Check user allowlist for the sender.
+	allowed, err = h.creator.IsUserAllowed(ctx, owner, repo, event.Sender.Login)
+	if err != nil {
+		logger.Error(err, "failed to check user allowlist", "user", event.Sender.Login)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		logger.Info("user not allowed", "user", event.Sender.Login, "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	req := TaskRequest{
+		Owner:    owner,
+		Repo:     repo,
+		Issue:    event.Issue.Number,
 		TaskType: "IssueSolve",
 	}
 
@@ -281,6 +408,18 @@ func (h *Handler) handlePRReview(ctx context.Context, w http.ResponseWriter, bod
 	}
 	if !allowed {
 		logger.Info("repo not allowed", "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	allowed, err = h.creator.IsUserAllowed(ctx, owner, repo, event.Review.User.Login)
+	if err != nil {
+		logger.Error(err, "failed to check user allowlist", "user", event.Review.User.Login)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		logger.Info("user not allowed", "user", event.Review.User.Login, "owner", owner, "repo", repo)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -384,6 +523,18 @@ func (h *Handler) handlePRReviewComment(ctx context.Context, w http.ResponseWrit
 	}
 	if !allowed {
 		logger.Info("repo not allowed", "owner", owner, "repo", repo)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	allowed, err = h.creator.IsUserAllowed(ctx, owner, repo, event.Comment.User.Login)
+	if err != nil {
+		logger.Error(err, "failed to check user allowlist", "user", event.Comment.User.Login)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		logger.Info("user not allowed", "user", event.Comment.User.Login, "owner", owner, "repo", repo)
 		w.WriteHeader(http.StatusOK)
 		return
 	}

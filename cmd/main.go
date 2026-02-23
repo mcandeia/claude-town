@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -70,6 +71,7 @@ type taskCreator struct {
 	client    ctrlclient.Client
 	namespace string
 	allowlist *controller.AllowlistCache
+	ghClient  ghclient.GitHubClient
 }
 
 func (tc *taskCreator) CreateTask(ctx context.Context, req webhookhandler.TaskRequest) error {
@@ -94,6 +96,53 @@ func (tc *taskCreator) CreateTask(ctx context.Context, req webhookhandler.TaskRe
 
 func (tc *taskCreator) IsRepoAllowed(_ context.Context, owner, repo string) (bool, error) {
 	return tc.allowlist.IsAllowed(fmt.Sprintf("%s/%s", owner, repo)), nil
+}
+
+func (tc *taskCreator) IsUserAllowed(ctx context.Context, owner, repo, username string) (bool, error) {
+	fullName := fmt.Sprintf("%s/%s", owner, repo)
+	users, roles := tc.allowlist.GetMergedAllowlist(fullName)
+
+	// If no restrictions configured, allow everyone.
+	if len(users) == 0 && len(roles) == 0 {
+		return true, nil
+	}
+
+	// Check username allowlist.
+	for _, u := range users {
+		if u == username {
+			return true, nil
+		}
+	}
+
+	// Check role allowlist.
+	if len(roles) > 0 && tc.ghClient != nil {
+		// Resolve per-repo client or use global.
+		ghc := tc.ghClient
+		if c := tc.allowlist.GetClient(fullName); c != nil {
+			ghc = c
+		}
+
+		perm, err := ghc.GetUserRepoPermission(ctx, owner, repo, username)
+		if err != nil {
+			return false, fmt.Errorf("checking user permission: %w", err)
+		}
+		for _, r := range roles {
+			if r == perm {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func (tc *taskCreator) GetAutoLabels(_ context.Context, owner, repo string) []string {
+	fullName := fmt.Sprintf("%s/%s", owner, repo)
+	r := tc.allowlist.Get(fullName)
+	if r == nil {
+		return nil
+	}
+	return r.Spec.Labels
 }
 
 func (tc *taskCreator) ResumeClarification(ctx context.Context, req webhookhandler.TaskRequest) (bool, error) {
@@ -174,6 +223,9 @@ func main() {
 	ghPrivateKey := os.Getenv("GITHUB_PRIVATE_KEY")
 	ghWebhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
 	ghBotName := envOrDefault("GITHUB_BOT_NAME", "claude-town")
+	ghPAT := os.Getenv("GITHUB_PAT")
+	ghAllowedUsers := splitComma(os.Getenv("GITHUB_ALLOWED_USERS"))
+	ghAllowedRoles := splitComma(os.Getenv("GITHUB_ALLOWED_ROLES"))
 	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
 	selfDNS := os.Getenv("SELF_DNS")
 	sandboxNamespace := envOrDefault("SANDBOX_NAMESPACE", "claude-town-system")
@@ -281,9 +333,9 @@ func main() {
 	}
 
 	// --- Create GitHub client ---
-	var githubClient *ghclient.Client
+	var githubClient ghclient.GitHubClient
 	if ghAppID > 0 && ghInstallID > 0 && ghPrivateKey != "" {
-		githubClient, err = ghclient.NewClient(ghclient.Config{
+		appClient, err := ghclient.NewClient(ghclient.Config{
 			AppID:          ghAppID,
 			InstallationID: ghInstallID,
 			PrivateKey:     []byte(ghPrivateKey),
@@ -292,19 +344,23 @@ func main() {
 			BotName:        ghBotName,
 		})
 		if err != nil {
-			setupLog.Error(err, "unable to create GitHub client")
+			setupLog.Error(err, "unable to create GitHub App client")
 			os.Exit(1)
 		}
+		githubClient = appClient
 
-		// Register webhook on startup.
+		// Register App-level webhook on startup.
 		if selfDNS != "" {
 			setupLog.Info("registering GitHub webhook", "url", fmt.Sprintf("https://%s/webhooks/github", selfDNS))
-			if err := githubClient.RegisterWebhook(context.Background()); err != nil {
+			if err := appClient.RegisterWebhook(context.Background()); err != nil {
 				setupLog.Error(err, "failed to register GitHub webhook (non-fatal)")
 			}
 		}
+	} else if ghPAT != "" {
+		githubClient = ghclient.NewPATClient(ghPAT, ghBotName)
+		setupLog.Info("using PAT-based GitHub authentication")
 	} else {
-		setupLog.Info("GitHub App credentials not fully configured, running without GitHub integration")
+		setupLog.Info("GitHub credentials not configured, running without GitHub integration")
 	}
 
 	// --- Create dynamic client for sandbox operations ---
@@ -317,6 +373,13 @@ func main() {
 
 	// --- Create shared allowlist cache ---
 	allowlist := controller.NewAllowlistCache()
+	allowlist.SetGlobalAllowlist(ghAllowedUsers, ghAllowedRoles)
+
+	// Build webhook URL for repo-level webhook auto-creation.
+	var webhookURL string
+	if selfDNS != "" {
+		webhookURL = fmt.Sprintf("https://%s/webhooks/github", selfDNS)
+	}
 
 	// --- Register controllers ---
 	if err := (&controller.ClaudeTaskReconciler{
@@ -334,9 +397,12 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ClaudeRepositoryReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Allowlist: allowlist,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Allowlist:      allowlist,
+		GlobalGHClient: githubClient,
+		WebhookURL:     webhookURL,
+		WebhookSecret:  ghWebhookSecret,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClaudeRepository")
 		os.Exit(1)
@@ -375,6 +441,7 @@ func main() {
 		client:    mgr.GetClient(),
 		namespace: sandboxNamespace,
 		allowlist: allowlist,
+		ghClient:  githubClient,
 	}
 
 	webhookHandler := webhookhandler.NewHandler(ghWebhookSecret, ghBotName, creator)
@@ -413,4 +480,20 @@ func envOrDefault(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+// splitComma splits a comma-separated string into trimmed non-empty parts.
+func splitComma(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }

@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	claudetownv1alpha1 "github.com/marcoscandeia/claude-town/api/v1alpha1"
+	ghclient "github.com/marcoscandeia/claude-town/internal/github"
 )
 
 // patternEntry holds a compiled regex pattern alongside its ClaudeRepository.
@@ -36,6 +37,13 @@ type AllowlistCache struct {
 	mu       sync.RWMutex
 	exact    map[string]*claudetownv1alpha1.ClaudeRepository
 	patterns map[string]*patternEntry // keyed by pattern string
+
+	// Per-repo GitHub clients (keyed same as exact/patterns).
+	clients map[string]ghclient.GitHubClient
+
+	// Global handler allowlist defaults.
+	globalAllowedUsers []string
+	globalAllowedRoles []string
 }
 
 // NewAllowlistCache creates a new empty AllowlistCache.
@@ -43,6 +51,7 @@ func NewAllowlistCache() *AllowlistCache {
 	return &AllowlistCache{
 		exact:    make(map[string]*claudetownv1alpha1.ClaudeRepository),
 		patterns: make(map[string]*patternEntry),
+		clients:  make(map[string]ghclient.GitHubClient),
 	}
 }
 
@@ -113,4 +122,60 @@ func (c *AllowlistCache) Get(fullName string) *claudetownv1alpha1.ClaudeReposito
 	}
 
 	return nil
+}
+
+// SetGlobalAllowlist sets the global default allowed users and roles.
+func (c *AllowlistCache) SetGlobalAllowlist(users, roles []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.globalAllowedUsers = users
+	c.globalAllowedRoles = roles
+}
+
+// SetClient stores a per-repo GitHubClient.
+func (c *AllowlistCache) SetClient(fullName string, client ghclient.GitHubClient) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clients[fullName] = client
+}
+
+// GetClient returns the per-repo GitHubClient, or nil if not set.
+func (c *AllowlistCache) GetClient(fullName string) ghclient.GitHubClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clients[fullName]
+}
+
+// DeleteClient removes a per-repo GitHubClient.
+func (c *AllowlistCache) DeleteClient(fullName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.clients, fullName)
+}
+
+// GetMergedAllowlist returns the union of global + per-repo allowed users and roles.
+func (c *AllowlistCache) GetMergedAllowlist(fullName string) (users []string, roles []string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	users = append(users, c.globalAllowedUsers...)
+	roles = append(roles, c.globalAllowedRoles...)
+
+	// Check exact match.
+	if repo, ok := c.exact[fullName]; ok {
+		users = append(users, repo.Spec.AllowedUsers...)
+		roles = append(roles, repo.Spec.AllowedRoles...)
+		return users, roles
+	}
+
+	// Check patterns.
+	for _, entry := range c.patterns {
+		if entry.re.MatchString(fullName) {
+			users = append(users, entry.repo.Spec.AllowedUsers...)
+			roles = append(roles, entry.repo.Spec.AllowedRoles...)
+			return users, roles
+		}
+	}
+
+	return users, roles
 }

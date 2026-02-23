@@ -50,8 +50,17 @@ spec:
                 secretKeyRef:
                   name: {{ include "claude-town.fullname" . }}-github
                   key: webhookSecret
+            - name: GITHUB_PAT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "claude-town.fullname" . }}-github
+                  key: pat
             - name: GITHUB_BOT_NAME
               value: {{ .Values.github.botName | quote }}
+            - name: GITHUB_ALLOWED_USERS
+              value: {{ join "," .Values.github.allowedUsers | quote }}
+            - name: GITHUB_ALLOWED_ROLES
+              value: {{ join "," .Values.github.allowedRoles | quote }}
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:

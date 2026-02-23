@@ -17,6 +17,8 @@ const (
 	maxCommentsPerThread = 50
 )
 
+var _ GitHubClient = (*Client)(nil)
+
 // Config holds the configuration for a GitHub App.
 type Config struct {
 	// AppID is the GitHub App's unique identifier.
@@ -124,6 +126,11 @@ func (c *Client) ReplyToReviewComment(ctx context.Context, owner, repo string, p
 	}
 
 	return nil
+}
+
+// GetCloneToken implements GitHubClient by creating a short-lived installation token.
+func (c *Client) GetCloneToken(ctx context.Context) (string, error) {
+	return c.GetInstallationToken(ctx)
 }
 
 // GetInstallationToken creates a short-lived installation access token that can
@@ -265,6 +272,44 @@ func (c *Client) FetchReviewCommentThread(ctx context.Context, owner, repo strin
 	}
 
 	return truncateThread(sb.String()), nil
+}
+
+// CreateRepoWebhook creates a webhook on a repository. Returns the hook ID.
+func (c *Client) CreateRepoWebhook(ctx context.Context, owner, repo, webhookURL, secret string) (int64, error) {
+	hook := &gogithub.Hook{
+		Config: &gogithub.HookConfig{
+			ContentType: gogithub.Ptr("json"),
+			URL:         gogithub.Ptr(webhookURL),
+			Secret:      gogithub.Ptr(secret),
+			InsecureSSL: gogithub.Ptr("0"),
+		},
+		Events: []string{"issues", "issue_comment", "pull_request_review", "pull_request_review_comment"},
+		Active: gogithub.Ptr(true),
+	}
+
+	created, _, err := c.installation.Repositories.CreateHook(ctx, owner, repo, hook)
+	if err != nil {
+		return 0, fmt.Errorf("creating webhook on %s/%s: %w", owner, repo, err)
+	}
+	return created.GetID(), nil
+}
+
+// DeleteRepoWebhook deletes a webhook from a repository.
+func (c *Client) DeleteRepoWebhook(ctx context.Context, owner, repo string, hookID int64) error {
+	_, err := c.installation.Repositories.DeleteHook(ctx, owner, repo, hookID)
+	if err != nil {
+		return fmt.Errorf("deleting webhook %d on %s/%s: %w", hookID, owner, repo, err)
+	}
+	return nil
+}
+
+// GetUserRepoPermission returns the user's permission level (admin, write, read, none).
+func (c *Client) GetUserRepoPermission(ctx context.Context, owner, repo, username string) (string, error) {
+	perm, _, err := c.installation.Repositories.GetPermissionLevel(ctx, owner, repo, username)
+	if err != nil {
+		return "", fmt.Errorf("getting permission for %s on %s/%s: %w", username, owner, repo, err)
+	}
+	return perm.GetPermission(), nil
 }
 
 // isBotUser returns true if the login matches the configured bot name.

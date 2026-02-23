@@ -32,6 +32,10 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "list", "watch"]
+  # Secrets (for PAT token references)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
   # Pods (for getting pod IP and exec)
   - apiGroups: [""]
     resources: ["pods"]

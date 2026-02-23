@@ -13,8 +13,11 @@ github:
   appId: ""
   installationId: ""
   privateKey: ""
+  pat: ""
   webhookSecret: ""
   botName: "claude-town"
+  allowedUsers: []
+  allowedRoles: []
 
 anthropic:
   apiKey: ""

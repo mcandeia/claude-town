@@ -75,7 +75,7 @@ type ClaudeTaskReconciler struct {
 	// SandboxClient manages SandboxClaim resources.
 	SandboxClient *sandbox.Client
 	// GitHubClient is used for commenting on issues and getting tokens.
-	GitHubClient *ghclient.Client
+	GitHubClient ghclient.GitHubClient
 	// Allowlist provides the list of allowed repositories.
 	Allowlist *AllowlistCache
 	// SandboxTemplateName is the name of the SandboxTemplate to use.
@@ -154,8 +154,9 @@ func (r *ClaudeTaskReconciler) reconcilePending(ctx context.Context, task *claud
 	}
 
 	// Comment on GitHub that work is starting.
+	ghClient := r.resolveGitHubClient(task.Spec.Repository)
 	startComment := fmt.Sprintf("Claude is starting to work on this. A sandbox has been allocated.\n\nTask: `%s`", task.Name)
-	if err := r.commentOnTask(ctx, task, owner, repo, startComment); err != nil {
+	if err := r.commentOnTask(ctx, ghClient, task, owner, repo, startComment); err != nil {
 		logger.Error(err, "failed to comment on task")
 		// Non-fatal — continue even if commenting fails.
 	}
@@ -220,14 +221,17 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		logger.Info("resuming after clarification", "round", n)
 	}
 
-	// Get GitHub installation token for git operations.
-	token, err := r.GitHubClient.GetInstallationToken(ctx)
+	// Resolve GitHub client for this repo (per-repo PAT > global).
+	ghClient := r.resolveGitHubClient(task.Spec.Repository)
+
+	// Get clone token for git operations.
+	token, err := ghClient.GetCloneToken(ctx)
 	if err != nil {
-		return r.failTask(ctx, task, fmt.Sprintf("failed to get installation token: %v", err))
+		return r.failTask(ctx, task, fmt.Sprintf("failed to get clone token: %v", err))
 	}
 
 	// Fetch full thread context from GitHub (non-fatal on error).
-	threadContext := r.fetchThreadContext(ctx, task, owner, repo)
+	threadContext := r.fetchThreadContext(ctx, ghClient, task, owner, repo)
 
 	// Build the command sequence.
 	prompt := r.buildPrompt(task, threadContext)
@@ -251,7 +255,7 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		if updateErr := r.Status().Update(ctx, task); updateErr != nil {
 			logger.Error(updateErr, "failed to save cost report before clarification")
 		}
-		return r.handleClarification(ctx, task, owner, repo, question)
+		return r.handleClarification(ctx, ghClient, task, owner, repo, question)
 	}
 
 	if err != nil {
@@ -286,7 +290,7 @@ func (r *ClaudeTaskReconciler) reconcileRunning(ctx context.Context, task *claud
 		completionComment += fmt.Sprintf("\n\nPull Request: %s", prURL)
 	}
 	completionComment += formatCostReport(task.Status.CostReport)
-	if err := r.commentOnTask(ctx, task, owner, repo, completionComment); err != nil {
+	if err := r.commentOnTask(ctx, ghClient, task, owner, repo, completionComment); err != nil {
 		logger.Error(err, "failed to comment completion")
 	}
 
@@ -339,7 +343,7 @@ func (r *ClaudeTaskReconciler) execInPod(ctx context.Context, podName, command s
 
 // handleClarification transitions the task to WaitingForClarification, appends the
 // question to the clarification history, and posts the question on GitHub.
-func (r *ClaudeTaskReconciler) handleClarification(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo, question string) (ctrl.Result, error) {
+func (r *ClaudeTaskReconciler) handleClarification(ctx context.Context, ghClient ghclient.GitHubClient, task *claudetownv1alpha1.ClaudeTask, owner, repo, question string) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
 	maxRounds := task.Spec.MaxClarifications
@@ -360,12 +364,12 @@ func (r *ClaudeTaskReconciler) handleClarification(ctx context.Context, task *cl
 
 	// Post the question on GitHub.
 	botName := ""
-	if r.GitHubClient != nil {
-		botName = r.GitHubClient.BotName()
+	if ghClient != nil {
+		botName = ghClient.BotName()
 	}
 	comment := fmt.Sprintf("**Claude needs clarification to continue:**\n\n> %s\n\nPlease reply mentioning @%s with your answer.", question, botName)
 	comment += formatCostReport(task.Status.CostReport)
-	if err := r.commentOnTask(ctx, task, owner, repo, comment); err != nil {
+	if err := r.commentOnTask(ctx, ghClient, task, owner, repo, comment); err != nil {
 		logger.Error(err, "failed to post clarification question on GitHub")
 	}
 
@@ -386,11 +390,12 @@ func (r *ClaudeTaskReconciler) failTask(ctx context.Context, task *claudetownv1a
 	}
 
 	// Comment failure on GitHub.
+	ghClient := r.resolveGitHubClient(task.Spec.Repository)
 	parts := strings.SplitN(task.Spec.Repository, "/", 2)
 	if len(parts) == 2 {
 		failComment := fmt.Sprintf("Claude failed to complete the task.\n\nReason: %s", reason)
 		failComment += formatCostReport(task.Status.CostReport)
-		if err := r.commentOnTask(ctx, task, parts[0], parts[1], failComment); err != nil {
+		if err := r.commentOnTask(ctx, ghClient, task, parts[0], parts[1], failComment); err != nil {
 			logger.Error(err, "failed to comment failure")
 		}
 	}
@@ -408,28 +413,34 @@ func (r *ClaudeTaskReconciler) failTask(ctx context.Context, task *claudetownv1a
 // commentOnTask posts a comment on the appropriate GitHub thread. If the task
 // has a ReviewCommentID, it replies in the review comment thread. Otherwise, it
 // posts a top-level issue/PR comment.
-func (r *ClaudeTaskReconciler) commentOnTask(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo, body string) error {
+func (r *ClaudeTaskReconciler) commentOnTask(ctx context.Context, ghClient ghclient.GitHubClient, task *claudetownv1alpha1.ClaudeTask, owner, repo, body string) error {
+	if ghClient == nil {
+		return nil
+	}
 	if task.Spec.ReviewCommentID > 0 && task.Spec.PullRequest > 0 {
-		return r.GitHubClient.ReplyToReviewComment(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID, body)
+		return ghClient.ReplyToReviewComment(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID, body)
 	}
 
 	issueNum := task.Spec.Issue
 	if task.Spec.PullRequest > 0 {
 		issueNum = task.Spec.PullRequest
 	}
-	return r.GitHubClient.CommentOnIssue(ctx, owner, repo, issueNum, body)
+	return ghClient.CommentOnIssue(ctx, owner, repo, issueNum, body)
 }
 
 // fetchThreadContext fetches full GitHub thread context for the task.
 // Errors are non-fatal — an empty string is returned on failure.
-func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, task *claudetownv1alpha1.ClaudeTask, owner, repo string) string {
+func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, ghClient ghclient.GitHubClient, task *claudetownv1alpha1.ClaudeTask, owner, repo string) string {
 	logger := logf.FromContext(ctx)
+	if ghClient == nil {
+		return ""
+	}
 	var parts []string
 
 	switch task.Spec.TaskType {
 	case claudetownv1alpha1.ClaudeTaskTypePRReviewFix:
 		if task.Spec.PullRequest > 0 {
-			prCtx, err := r.GitHubClient.FetchPRContext(ctx, owner, repo, task.Spec.PullRequest)
+			prCtx, err := ghClient.FetchPRContext(ctx, owner, repo, task.Spec.PullRequest)
 			if err != nil {
 				logger.Error(err, "failed to fetch PR context")
 			} else if prCtx != "" {
@@ -437,7 +448,7 @@ func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, task *cla
 			}
 		}
 		if task.Spec.ReviewCommentID > 0 && task.Spec.PullRequest > 0 {
-			threadCtx, err := r.GitHubClient.FetchReviewCommentThread(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID)
+			threadCtx, err := ghClient.FetchReviewCommentThread(ctx, owner, repo, task.Spec.PullRequest, task.Spec.ReviewCommentID)
 			if err != nil {
 				logger.Error(err, "failed to fetch review comment thread")
 			} else if threadCtx != "" {
@@ -446,7 +457,7 @@ func (r *ClaudeTaskReconciler) fetchThreadContext(ctx context.Context, task *cla
 		}
 	default:
 		if task.Spec.Issue > 0 {
-			issueCtx, err := r.GitHubClient.FetchIssueThread(ctx, owner, repo, task.Spec.Issue)
+			issueCtx, err := ghClient.FetchIssueThread(ctx, owner, repo, task.Spec.Issue)
 			if err != nil {
 				logger.Error(err, "failed to fetch issue thread")
 			} else if issueCtx != "" {
@@ -647,6 +658,16 @@ func formatCostReport(cr *claudetownv1alpha1.CostReport) string {
 	durationSec := float64(cr.DurationMs) / 1000.0
 	return fmt.Sprintf("\n\n---\n📊 **Cost:** %s | **Tokens:** %d in / %d out | **Duration:** %.1fs",
 		cr.EstimatedCost, cr.InputTokens, cr.OutputTokens, durationSec)
+}
+
+// resolveGitHubClient returns the per-repo client if available, else the global client.
+func (r *ClaudeTaskReconciler) resolveGitHubClient(repository string) ghclient.GitHubClient {
+	if r.Allowlist != nil {
+		if c := r.Allowlist.GetClient(repository); c != nil {
+			return c
+		}
+	}
+	return r.GitHubClient
 }
 
 // SetupWithManager sets up the controller with the Manager.
