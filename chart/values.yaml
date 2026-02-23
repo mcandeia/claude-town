@@ -1,12 +1,12 @@
 image:
-  repository: ghcr.io/marcoscandeia/claude-town
+  repository: ghcr.io/mcandeia/claude-town
   tag: latest
   pullPolicy: IfNotPresent
 
 replicaCount: 1
 
 claudeImage:
-  repository: ghcr.io/marcoscandeia/claude
+  repository: ghcr.io/mcandeia/claude
   tag: latest
 
 github:
