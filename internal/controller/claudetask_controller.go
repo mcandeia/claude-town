@@ -545,7 +545,7 @@ func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *cla
 	// Run Claude with the prompt. Use --print and --dangerously-skip-permissions
 	// for autonomous execution.
 	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
-	fmt.Fprintf(&sb, "claude --print --output-format json --dangerously-skip-permissions '%s'\n", escapedPrompt)
+	fmt.Fprintf(&sb, "claude --print --verbose --output-format stream-json --dangerously-skip-permissions '%s' 2>&1 | tee /proc/1/fd/1\n", escapedPrompt)
 
 	return sb.String()
 }
