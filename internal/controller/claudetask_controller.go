@@ -61,6 +61,33 @@ const (
 
 	// How long to wait for a user's clarification reply before timing out.
 	clarificationWaitTimeout = 24 * time.Hour
+
+	// streamFormatterScript is an inline Node.js script that reads stream-json
+	// lines from stdin and writes a human-readable log to stdout.
+	streamFormatterScript = `
+const rl = require("readline").createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  let e;
+  try { e = JSON.parse(line); } catch { process.stdout.write(line + "\\n"); return; }
+  const t = e.type;
+  if (t === "system") {
+    console.log("[init] model=" + e.model + " session=" + e.session_id);
+  } else if (t === "assistant") {
+    const c = (e.message && e.message.content) || [];
+    for (const b of c) {
+      if (b.type === "thinking") console.log("[thinking] " + b.thinking);
+      else if (b.type === "tool_use") console.log("[tool] " + b.name + ": " + JSON.stringify(b.input));
+      else if (b.type === "text") console.log("[text] " + b.text);
+    }
+  } else if (t === "user" && e.tool_use_result) {
+    const r = e.tool_use_result;
+    if (r.stdout) console.log("[result] " + r.stdout.slice(0, 500));
+    if (r.stderr) console.log("[stderr] " + r.stderr.slice(0, 500));
+  } else if (t === "result") {
+    console.log("[done] " + e.subtype + " | cost=$" + (e.total_cost_usd||0).toFixed(4) + " | turns=" + e.num_turns + " | " + ((e.duration_ms||0)/1000).toFixed(1) + "s");
+  }
+});
+`
 )
 
 // ClaudeTaskReconciler reconciles a ClaudeTask object.
@@ -544,8 +571,10 @@ func (r *ClaudeTaskReconciler) buildCommand(owner, repo, token string, task *cla
 
 	// Run Claude with the prompt. Use --print and --dangerously-skip-permissions
 	// for autonomous execution.
+	// Pipe raw JSON to stdout (exec buffer) and a human-readable format to
+	// the container's PID 1 stdout (visible via kubectl logs).
 	escapedPrompt := strings.ReplaceAll(prompt, "'", "'\\''")
-	fmt.Fprintf(&sb, "claude --print --verbose --output-format stream-json --dangerously-skip-permissions '%s' 2>&1 | tee /proc/1/fd/1\n", escapedPrompt)
+	fmt.Fprintf(&sb, "claude --print --verbose --output-format stream-json --dangerously-skip-permissions '%s' 2>&1 | tee >(node -e '%s' > /proc/1/fd/1)\n", escapedPrompt, streamFormatterScript)
 
 	return sb.String()
 }
